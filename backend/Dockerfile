@@ -5,16 +5,14 @@ FROM python:3.14.6-slim AS builder
 
 WORKDIR /build
 
-# Install basic system build dependencies if required by native extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only the verified dependency matrix
 COPY requirements.txt .
 
-# Compile dependencies directly into a isolated local wheels cache
-RUN pip install --no-cache-dir --user -r requirements.txt
+# REMOVED --user: Install directly to standard system path for clean copying
+RUN pip install --no-cache-dir --target=/build/packages -r requirements.txt
 
 # ==============================================================================
 # STAGE 2: Minimal Production Runtime
@@ -23,18 +21,19 @@ FROM python:3.14.6-slim AS runner
 
 WORKDIR /workspace/backend
 
-# Copy installed packages from the builder stage user space
-COPY --from=builder /root/.local /root/.local
+# Copy packages from builder stage directly into Python's global site-packages
+COPY --from=builder /build/packages /usr/local/lib/python3.14/site-packages
+COPY --from=builder /build/packages/bin /usr/local/bin
+
 COPY requirements.txt .
 
-# Ensure the compiled user-space binaries are on the system executable path
-ENV PATH=/root/.local/bin:$PATH
 ENV PYTHONPATH=/workspace/backend
 
 # Copy application source modules securely
 COPY app/ ./app/
 
-# Enforce security best-practices: Drop root privileges for runtime execution
+# Enforce security best-practices: Ensure non-root user owns the workspace
+RUN chown -R 1001:1001 /workspace/backend
 USER 1001
 
 # Expose the core FastAPI network communication port
