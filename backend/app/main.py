@@ -184,45 +184,45 @@ _DOCS_ENABLED: Final[bool] = _SENTINEL_ENV in {"development", "dev", "local"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Fail closed before any resource is opened — a misconfigured process
-    # must never come up half-authenticated or half-targeted.
-    api_key = _load_api_key()
-    feed_targets = _load_feed_targets()
-    ingestion_timeout = _load_ingestion_timeout_seconds()
+    # Fail closed before any resource is opened
+    try:
+        api_key = _load_api_key()
+        feed_targets = _load_feed_targets()
+        ingestion_timeout = _load_ingestion_timeout_seconds()
 
-    # Automatically generate SQLite database file binary structure and table schemas if uninitialized
-    Base.metadata.create_all(bind=engine)
+        # Automatically generate SQLite structure on boot
+        Base.metadata.create_all(bind=engine)
 
-    logger.info(
-        "startup.begin",
-        extra={"feed_count": len(feed_targets), "environment": _SENTINEL_ENV},
-    )
+        logger.info(
+            "startup.begin",
+            extra={"feed_count": len(feed_targets), "environment": _SENTINEL_ENV},
+        )
 
-    start = time.monotonic()
-    
-    # Initialize our pipeline instance cleanly using unified constructor mappings
-    pipeline = OSINTPipeline(target_feeds=feed_targets)
+        start = time.monotonic()
+        
+        # Initialize our pipeline instance cleanly
+        pipeline = OSINTPipeline(target_feeds=feed_targets)
 
-    # Bind active state variables straight to the FastAPI runtime application space
-    app.state.pipeline = pipeline
-    app.state.api_key = api_key
-    app.state.ingestion_timeout_seconds = ingestion_timeout
+        # Bind active state variables straight to the FastAPI runtime
+        app.state.pipeline = pipeline
+        app.state.api_key = api_key
+        app.state.ingestion_timeout_seconds = ingestion_timeout
 
-    logger.info(
-        "startup.complete",
-        extra={"elapsed_ms": round((time.monotonic() - start) * 1000, 2)},
-    )
+        logger.info(
+            "startup.complete",
+            extra={"elapsed_ms": round((time.monotonic() - start) * 1000, 2)},
+        )
+    except Exception as exc:
+        logger.critical("startup.pipeline_init_failed", exc_info=True)
+        raise RuntimeError("Application failed to initialize secure infrastructure.") from exc
 
     try:
         yield
     finally:
         logger.info("shutdown.begin")
         try:
-            # Safely release underlying HTTPX connection pools during teardown
             await pipeline.close()
         except Exception:
-            # A clean shutdown must not crash on resource teardown failures —
-            # log and continue so the process still exits.
             logger.error("shutdown.pipeline_close_failed", exc_info=True)
         logger.info("shutdown.complete")
 

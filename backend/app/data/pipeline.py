@@ -25,12 +25,24 @@ class OSINTPipeline:
     """
     def __init__(self, target_feeds: List[str]):
         self.target_feeds = target_feeds
-        self.http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        # Implement lazy-loading properties protected by an atomic lock boundary
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._lock = asyncio.Lock()
+
+    @property
+    async def http_client(self) -> httpx.AsyncClient:
+        """Safely fetches or initializes the HTTPX client pool using a double-check lock pattern."""
+        if self._http_client is None:
+            async with self._lock:
+                if self._http_client is None:
+                    self._http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        return self._http_client
 
     async def fetch_feed_data(self, url: str) -> Optional[str]:
         """Fetch raw XML/RSS data asynchronously."""
         try:
-            response = await self.http_client.get(url)
+            client = await self.http_client
+            response = await client.get(url)
             response.raise_for_status()
             return response.text
         except httpx.HTTPError as exc:
@@ -181,4 +193,5 @@ class OSINTPipeline:
 
     async def close(self):
         """Gracefully release HTTP connections."""
-        await self.http_client.aclose()
+        if self._http_client is not None:
+            await self._http_client.aclose()
