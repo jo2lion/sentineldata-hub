@@ -18,30 +18,18 @@ symbols that need to change:
 
     app.data.pipeline.OSINTPipeline
         class OSINTPipeline:
-            def __init__(self, feed_urls: Sequence[str]) -> None: ...
-            async def __aenter__(self) -> "OSINTPipeline": ...
-            async def __aexit__(self, exc_type, exc, tb) -> None: ...
-            async def run_ingestion_cycle(self) -> list[ThreatIndicator]: ...
-
-        The async context-manager protocol is expected to own all
-        per-process resources (e.g. a shared httpx.AsyncClient) and to open
-        them in __aenter__ / close them in __aexit__. run_ingestion_cycle()
-        is expected to fan out across feed_urls concurrently internally and
-        return validated ThreatIndicator instances; partial-feed failures
-        should be handled/logged inside the pipeline, not raised per-feed,
-        so a single dead feed does not fail the whole cycle. Only fatal,
-        whole-cycle failures (total upstream outage, schema-breaking
-        upstream changes) are expected to propagate as exceptions, and are
-        mapped to HTTP responses below.
+            def __init__(self, target_feeds: list[str]) -> None: ...
+            async def run(self) -> list[ThreatIndicator]: ...
+            async def close(self) -> None: ...
 
 Required environment variables (fail-closed — the process refuses to start
 without them):
 
     SENTINEL_API_KEY               Shared secret required in the
-                                    ``X-API-Key`` header on every request to
-                                    /api/v1/threats.
-    SENTINEL_FEED_URLS              Comma-separated list of OSINT/CVE feed
-                                    URLs to ingest.
+                                   ``X-API-Key`` header on every request to
+                                   /api/v1/threats.
+    SENTINEL_FEED_URLS             Comma-separated list of OSINT/CVE feed
+                                   URLs to ingest.
 
 Optional environment variables:
 
@@ -83,6 +71,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.data.pipeline import OSINTPipeline
 from app.models.threat import ThreatIndicator
+
+# --- PHASE 5: DATABASE SCHEMATIC INTERFACES ---
+from app.database.connection import Base, engine
+from app.database.models import ThreatIndicatorModel  # Pre-loads and registers table metadata with the Base object
 
 # --------------------------------------------------------------------------- #
 # Structured (JSON) logging — required for enterprise log-aggregator
@@ -198,6 +190,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     feed_targets = _load_feed_targets()
     ingestion_timeout = _load_ingestion_timeout_seconds()
 
+    # Automatically generate SQLite database file binary structure and table schemas if uninitialized
+    Base.metadata.create_all(bind=engine)
+
     logger.info(
         "startup.begin",
         extra={"feed_count": len(feed_targets), "environment": _SENTINEL_ENV},
@@ -205,7 +200,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     start = time.monotonic()
     
-    # Initialize our pipeline instance cleanly
+    # Initialize our pipeline instance cleanly using unified constructor mappings
     pipeline = OSINTPipeline(target_feeds=feed_targets)
 
     # Bind active state variables straight to the FastAPI runtime application space

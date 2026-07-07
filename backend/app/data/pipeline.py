@@ -10,6 +10,10 @@ import pandas as pd
 from pydantic import ValidationError
 
 from app.models.threat import ThreatIndicator
+# --- PHASE 5: DATABASE IMPORTS ---
+from sqlalchemy.orm import Session
+from app.database.connection import SessionLocal
+from app.database.models import ThreatIndicatorModel
 
 # Explicit logging schema setup for system tracking
 logger = logging.getLogger("sentineldata.pipeline")
@@ -140,6 +144,37 @@ class OSINTPipeline:
             except ValidationError as val_err:
                 logger.error(f"Pydantic Validation Guard Rejected Row {row.get('indicator_id')}: {val_err.json()}")
                 continue
+
+        # --- PHASE 5: PERSISTENCE ENGINE ENGINE ---
+        # Write validated structures straight into the SQLite Relational Engine
+        if validated_indicators:
+            db: Session = SessionLocal()
+            try:
+                stored_count = 0
+                for indicator in validated_indicators:
+                    # Idempotency guard: Prevent duplicating items using UUIDv5 matching
+                    exists = db.query(ThreatIndicatorModel).filter(ThreatIndicatorModel.id == indicator.id).first()
+                    if not exists:
+                        db_record = ThreatIndicatorModel(
+                            id=indicator.id,
+                            title=indicator.title,
+                            link=indicator.source_url,
+                            summary=indicator.description,
+                            published_date=indicator.observed_at,
+                            risk_score=indicator.risk_score
+                        )
+                        db.add(db_record)
+                        stored_count += 1
+                
+                if stored_count > 0:
+                    db.commit()
+                    logger.info(f"Database sync complete. Saved {stored_count} new indicators to SQLite.")
+            except Exception:
+                db.rollback()
+                logger.error("Database persistence sub-cycle failed.", exc_info=True)
+                # Fail-open: don't crash the network request if storage hits a localized snag
+            finally:
+                db.close()
 
         logger.info(f"Ingestion lifecycle completed. Emitted {len(validated_indicators)} validated threat vectors.")
         return validated_indicators
