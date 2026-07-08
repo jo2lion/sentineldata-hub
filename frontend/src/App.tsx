@@ -2,6 +2,9 @@ import { useMemo, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { DashboardMetrics, ThreatIndicator } from "./types/threat";
+import type { SeverityTier } from "./lib/severity";
+import { SEVERITY_TIERS, classifySeverityTier, SEVERITY_TIER_TEXT_CLASS } from "./lib/severity";
+import { ThreatAnalytics } from "./components/ThreatAnalytics";
 
 // --------------------------------------------------------------------------- #
 // SECURITY — read before this goes anywhere near a real deployment.
@@ -395,23 +398,12 @@ function MetricsPanel() {
 // that validation.
 // --------------------------------------------------------------------------- #
 
-type SeverityTier = "Critical" | "High" | "Medium" | "Low";
-
-const SEVERITY_TIERS: readonly SeverityTier[] = ["Critical", "High", "Medium", "Low"];
-
-function classifySeverityTier(riskScore: number): SeverityTier {
-  if (riskScore >= 5.0) return "Critical";
-  if (riskScore >= 4.0) return "High";
-  if (riskScore >= 3.0) return "Medium";
-  return "Low";
-}
-
-const SEVERITY_TIER_TEXT_CLASS: Record<SeverityTier, string> = {
-  Critical: "text-signal-critical",
-  High: "text-signal-warning",
-  Medium: "text-signal-warning/70",
-  Low: "text-signal-ok",
-};
+// SeverityTier / SEVERITY_TIERS / classifySeverityTier / SEVERITY_TIER_TEXT_CLASS
+// now live in ./lib/severity.ts, not here -- extracted this pass because
+// ThreatAnalytics.tsx's Risk Composition donut became a third consumer of
+// the exact same classification. See that module's own doc comment for why
+// riskTone/matchesRiskFilter below are deliberately NOT also routed through
+// it.
 
 type YearSeverityRow = {
   year: number;
@@ -553,6 +545,8 @@ export default function App() {
         <MetricsPanel />
 
         <CveMetricsGrid indicators={data} />
+
+        <ThreatAnalytics indicators={data} isLoading={isLoading} />
 
         {isLoading && <p className="text-sm text-grid-300">Running ingestion cycle…</p>}
 
