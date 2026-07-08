@@ -1,7 +1,7 @@
-# ==============================================================================
-# STAGE 1: Build & Dependency Assembly
-# ==============================================================================
-FROM python:3.14.6-slim AS builder
+# ==========================================
+# STAGE 1: BUILDER
+# ==========================================
+FROM docker.io/library/python:3.14.6-slim AS builder
 
 WORKDIR /build
 
@@ -9,35 +9,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Create a clean, relocatable virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# REMOVED --user: Install directly to standard system path for clean copying
-RUN pip install --no-cache-dir --target=/build/packages -r requirements.txt
+# ==========================================
+# STAGE 2: RUNNER
+# ==========================================
+FROM docker.io/library/python:3.14.6-slim AS runner
 
-# ==============================================================================
-# STAGE 2: Minimal Production Runtime
-# ==============================================================================
-FROM python:3.14.6-slim AS runner
+# Hardening: Install standard CA bundles for trusted outbound SSL handshakes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create an unprivileged system user to run the API node securely
+RUN useradd --create-home --shell /bin/bash sentinel
 
 WORKDIR /workspace/backend
 
-# Copy packages from builder stage directly into Python's global site-packages
-COPY --from=builder /build/packages /usr/local/lib/python3.14/site-packages
-COPY --from=builder /build/packages/bin /usr/local/bin
+# Copy the entire clean venv environment straight from the builder stage
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
 
-COPY requirements.txt .
+# Change ownership of the workspace to our non-root account
+COPY . .
+RUN chown -r sentinel:sentinel /workspace/backend
 
-ENV PYTHONPATH=/workspace/backend
+USER sentinel
 
-# Copy application source modules securely
-COPY app/ ./app/
-
-# Enforce security best-practices: Ensure non-root user owns the workspace
-RUN chown -R 1001:1001 /workspace/backend
-USER 1001
-
-# Expose the core FastAPI network communication port
 EXPOSE 8000
 
-# Set the system entrypoint to initialize our high-throughput server architecture
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+
+CMD ["python", "-m", "app.main"]

@@ -337,10 +337,18 @@ async def get_threats(request: Request) -> list[ThreatIndicator]:
         ) from exc
 
     elapsed_ms = round((time.monotonic() - cycle_start) * 1000, 2)
-    logger.info(
-        "ingestion.cycle_complete",
-        extra={"indicator_count": len(indicators), "elapsed_ms": elapsed_ms},
-    )
+
+    if len(indicators) == 0:
+        logger.error(
+            "ingestion.wholesale_outage_empty_cycle", 
+            extra={"feed_count": len(feed_targets), "elapsed_ms": elapsed_ms}
+        )
+    else:
+        logger.info(
+            "ingestion.cycle_complete",
+            extra={"indicator_count": len(indicators), "elapsed_ms": elapsed_ms},
+        )
+        
     return indicators
 
 
