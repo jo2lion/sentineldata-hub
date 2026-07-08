@@ -1,3 +1,5 @@
+import { useMemo, useState } from "react";
+import type { ChangeEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { DashboardMetrics, ThreatIndicator } from "./types/threat";
 
@@ -51,11 +53,6 @@ async function fetchMetrics(): Promise<DashboardMetrics> {
   return (await response.json()) as DashboardMetrics;
 }
 
-// Custom text utility to securely drop raw HTML tag structures on display
-function stripHtmlTags(htmlString: string): string {
-  return htmlString.replace(/<\/?[^>]+(>|$)/g, " ").trim();
-}
-
 function useMetrics() {
   return useQuery({
     queryKey: ["metrics"],
@@ -87,8 +84,9 @@ function StatusPill({ tone, label }: { tone: PillTone; label: string }) {
 function OutageBanner() {
   // Explicit, high-visibility handling of the len(indicators) == 0 case —
   // matches the backend's deliberate design: total outage returns 200 with
-  // an empty list, not an error. Silently rendering "0 rows" here would be
-  // exactly the failure mode that design decision was reviewed to avoid.
+  // an empty list, not an error. This is distinct from "the search/filter
+  // matched nothing" below -- conflating the two would hide a real backend
+  // outage behind what looks like a harmless empty filter result.
   return (
     <div
       role="alert"
@@ -110,6 +108,19 @@ function OutageBanner() {
   );
 }
 
+function NoFilterMatchesNotice({ totalCount }: { totalCount: number }) {
+  // Deliberately separate from OutageBanner. This fires when the backend
+  // returned real data but the client-side search/risk filter narrowed it
+  // to zero rows -- a completely different situation from a wholesale feed
+  // outage, and one that should never be styled as an error.
+  return (
+    <p className="rounded-lg border border-grid-700 bg-grid-900/40 px-4 py-6 text-center text-sm text-grid-300">
+      No indicators match the current search/filter. {totalCount} total indicator
+      {totalCount === 1 ? "" : "s"} loaded.
+    </p>
+  );
+}
+
 // risk_score is bounded 1.0-5.0 and, per pipeline.py's _process_batch, only ever
 // actually takes the discrete values {1.0, 3.0, 4.0, 5.0} today. Thresholds are
 // set to match that bucketing, not an arbitrary continuous scale.
@@ -118,6 +129,65 @@ function riskTone(riskScore: number): string {
   if (riskScore >= 4.0) return "text-signal-warning";
   if (riskScore >= 3.0) return "text-signal-warning/70";
   return "text-signal-ok";
+}
+
+// --------------------------------------------------------------------------- #
+// Defensive runtime guard
+//
+// ThreatIndicator.description is typed as a required `string` (mirroring the
+// Pydantic contract, which does require it) -- that's a compile-time
+// promise, not a runtime one. A bad row, a partial migration, or any future
+// write path that bypasses ThreatIndicator's own validator could still hand
+// the frontend a null/undefined value that matches the JSON shape but
+// violates the contract. Guarding here, not by loosening the TS type: the
+// type stays honest about what the contract promises; this is defense
+// against the contract being violated, not a redefinition of it.
+//
+// Tag-stripping does not do any XSS-relevant work by itself -- the result
+// is rendered as plain JSX text ({cleansedDescription}), which React escapes
+// regardless of whether it contains "<" characters. This function's job is
+// null-safety and display hygiene only. It must never be passed to
+// dangerouslySetInnerHTML -- stripping tags with a regex is not a sanitizer
+// (it's bypassable by malformed/nested markup) and was exactly the wrong
+// tool for the dangerouslySetInnerHTML XSS found and removed from this file
+// two passes ago.
+// --------------------------------------------------------------------------- #
+
+function stripHtmlTags(htmlString: string | undefined | null): string {
+  if (!htmlString) return "";
+  return htmlString.replace(/<\/?[^>]+(>|$)/g, " ").trim();
+}
+
+// --------------------------------------------------------------------------- #
+// Client-side search + risk filter
+//
+// The risk filter dropdown exposes 3 buckets (critical/warning/ok), not the
+// 4 tiers riskTone() renders (critical/high/medium/baseline). "warning" here
+// intentionally collapses both the 4.0 ("high") and 3.0 ("medium") tiers
+// into one bucket, since there's no separate "medium" option in the spec.
+// Stated here explicitly rather than silently decided.
+// --------------------------------------------------------------------------- #
+
+type RiskFilter = "all" | "critical" | "warning" | "ok";
+
+const RISK_FILTER_OPTIONS: ReadonlyArray<{ value: RiskFilter; label: string }> = [
+  { value: "all", label: "All Risk Levels" },
+  { value: "critical", label: "Critical (≥5.0)" },
+  { value: "warning", label: "Warning (3.0–4.9)" },
+  { value: "ok", label: "Baseline (<3.0)" },
+];
+
+function matchesRiskFilter(riskScore: number, filter: RiskFilter): boolean {
+  switch (filter) {
+    case "all":
+      return true;
+    case "critical":
+      return riskScore >= 5.0;
+    case "warning":
+      return riskScore >= 3.0 && riskScore < 5.0;
+    case "ok":
+      return riskScore < 3.0;
+  }
 }
 
 // --------------------------------------------------------------------------- #
@@ -205,6 +275,29 @@ function MetricsPanel() {
 export default function App() {
   const { data, isLoading, isError, error, dataUpdatedAt } = useThreats();
 
+  const [searchQuery, setSearchQuery] = useState("");
+  const [riskFilter, setRiskFilter] = useState<RiskFilter>("all");
+
+  // Derived, not stored -- filteredData is always a pure function of
+  // (data, searchQuery, riskFilter). useMemo avoids recomputing the filter
+  // pass on unrelated re-renders (e.g. the metrics query refetching).
+  const filteredData = useMemo(() => {
+    if (!data) return [];
+    const normalizedQuery = searchQuery.trim().toLowerCase();
+    return data.filter((indicator) => {
+      if (!matchesRiskFilter(indicator.risk_score, riskFilter)) return false;
+      if (!normalizedQuery) return true;
+      // Both sides guarded against a null/undefined field slipping past the
+      // TS contract at runtime -- see stripHtmlTags' comment above for why.
+      const safeTitle = indicator.title ?? "";
+      const safeDescription = stripHtmlTags(indicator.description);
+      return (
+        safeTitle.toLowerCase().includes(normalizedQuery) ||
+        safeDescription.toLowerCase().includes(normalizedQuery)
+      );
+    });
+  }, [data, searchQuery, riskFilter]);
+
   return (
     <div className="min-h-screen bg-grid-950 text-grid-100">
       <header className="border-b border-grid-700 px-6 py-4">
@@ -241,29 +334,64 @@ export default function App() {
 
         {!isLoading && !isError && data && data.length > 0 && (
           <>
-            <p className="mb-4 text-xs text-grid-300">
-              {data.length} indicator{data.length === 1 ? "" : "s"} · last synced{" "}
-              {new Date(dataUpdatedAt).toLocaleTimeString()}
-            </p>
-            <div className="overflow-hidden rounded-lg border border-grid-700">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-grid-800 text-grid-300">
-                  <tr>
-                    <th className="px-4 py-3 font-medium">Title</th>
-                    <th className="px-4 py-3 font-medium">Description</th>
-                    <th className="px-4 py-3 font-medium">Source</th>
-                    <th className="px-4 py-3 font-medium">Observed At</th>
-                    <th className="px-4 py-3 font-medium">Risk</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-grid-700">
-                  {data.map((indicator) => {
-                    const cleansedDescription = stripHtmlTags(indicator.description);
-                    return (
-                      <tr key={indicator.id} className="hover:bg-grid-800/60 align-top">
-                        <td className="px-4 py-3 font-mono text-grid-100 whitespace-nowrap">{indicator.title}</td>
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex flex-1 flex-col gap-3 sm:flex-row sm:items-center">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => setSearchQuery(event.target.value)}
+                  placeholder="Search title or description…"
+                  aria-label="Search indicators by title or description"
+                  className="w-full rounded-md border border-grid-700 bg-grid-900 px-3 py-2 text-sm text-grid-100 placeholder:text-grid-400 focus:border-grid-500 focus:outline-none sm:max-w-xs"
+                />
+                <select
+                  value={riskFilter}
+                  onChange={(event: ChangeEvent<HTMLSelectElement>) => setRiskFilter(event.target.value as RiskFilter)}
+                  aria-label="Filter indicators by risk level"
+                  className="w-full rounded-md border border-grid-700 bg-grid-900 px-3 py-2 text-sm text-grid-100 focus:border-grid-500 focus:outline-none sm:w-auto"
+                >
+                  {RISK_FILTER_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <p className="whitespace-nowrap text-xs text-grid-300">
+                {filteredData.length} of {data.length} indicator{data.length === 1 ? "" : "s"} · last synced{" "}
+                {new Date(dataUpdatedAt).toLocaleTimeString()}
+              </p>
+            </div>
+
+            {filteredData.length === 0 ? (
+              <NoFilterMatchesNotice totalCount={data.length} />
+            ) : (
+              <div className="overflow-hidden rounded-lg border border-grid-700">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-grid-800 text-grid-300">
+                    <tr>
+                      <th className="px-4 py-3 font-medium">Title</th>
+                      <th className="px-4 py-3 font-medium">Description</th>
+                      <th className="px-4 py-3 font-medium">Source</th>
+                      <th className="px-4 py-3 font-medium">Observed At</th>
+                      <th className="px-4 py-3 font-medium">Risk</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-grid-700">
+                    {filteredData.map((indicator) => {
+                      // Null-safe, tag-stripped, still rendered as plain JSX
+                      // text below -- never passed to dangerouslySetInnerHTML.
+                      const cleansedDescription = stripHtmlTags(indicator.description);
+                      return (
+                      <tr
+                        key={indicator.id}
+                        className="align-top transition-colors hover:bg-grid-800/60"
+                      >
+                        <td className="px-4 py-3 font-mono text-grid-100 whitespace-nowrap">
+                          {indicator.title}
+                        </td>
                         <td
-                          className="max-w-xl px-4 py-3 text-grid-300 text-sm leading-relaxed"
+                          className="max-w-xs truncate px-4 py-3 text-grid-300"
                           title={cleansedDescription}
                         >
                           {cleansedDescription}
@@ -285,11 +413,12 @@ export default function App() {
                           {indicator.risk_score.toFixed(1)}
                         </td>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </>
         )}
       </main>
