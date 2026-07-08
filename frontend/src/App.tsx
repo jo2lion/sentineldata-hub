@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { ChangeEvent } from "react";
+import type { ChangeEvent, ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { DashboardMetrics, ThreatIndicator } from "./types/threat";
 
@@ -63,7 +63,62 @@ function useMetrics() {
 
 type PillTone = "ok" | "warning" | "critical" | "muted";
 
-function StatusPill({ tone, label }: { tone: PillTone; label: string }) {
+// --------------------------------------------------------------------------- #
+// Connection status dot -- inline inside StatusPill, not a separate component.
+//
+// A prior pass extracted this into a standalone LiveStatusDot component
+// rendered next to StatusPill. This ticket explicitly removes that: the dot
+// goes back to being the literal <span> StatusPill always rendered in this
+// exact spot, just now state-driven instead of a flat bg-current. One
+// element, one component boundary -- not two.
+//
+// bg-green-500/400, bg-yellow-500/400, and bg-red-500 are Tailwind's built-in
+// default-palette colors, not this project's custom signal-*/grid-* tokens --
+// deliberately so, same reasoning as the prior pass: index.css only contains
+// `@import "tailwindcss";` with no @theme block defining --color-signal-* /
+// --color-grid-* anywhere, and main.tsx imports a separate, already-stale
+// ./styles/output.css instead of index.css. That is a real, separate,
+// still-unresolved finding -- not fixed here, out of this ticket's scope --
+// and stock Tailwind palette colors sidestep it entirely since they need no
+// @theme customization to resolve.
+//
+// isFetching alone is sufficient for the amber/syncing branch even though
+// this ticket's spec calls out "isFetching or isLoading": TanStack Query's
+// isLoading (no cached data yet) is a strict subset of isFetching (any fetch
+// in flight, including background refetches on the existing 30s
+// refetchInterval) -- isLoading true always implies isFetching true. The
+// condition below is still written as the literal isFetching (not simplified
+// further), so it reads the same as the ticket's stated logic rather than
+// silently depending on readers already knowing that subset relationship.
+//
+// No new timer, no local useEffect polling loop: this is still driven
+// entirely by useThreats()'s existing TanStack Query state in App(), which
+// already owns connection-health polling safely (bounded retries, requests
+// cancelled on unmount). That's what guarantees no runaway "state processing
+// loop" here, same as the prior pass.
+//
+// Known, deliberately NOT fixed here: StatusPill's tone/label text (the
+// "Connection Fault" / "Syncing" / "Live" string and its signal-* color) is
+// still driven by isLoading alone, unchanged from before this ticket. During
+// a background refetch (isFetching true, isLoading false, isError false) the
+// dot will pulse amber while the label still reads "Live" -- a real,
+// momentary dot/label disagreement. This ticket only asked to wire the dot's
+// conditional styling to isError/isFetching, not to rework the label logic;
+// changing that is a separate, unscoped decision, flagged here rather than
+// silently left inconsistent or silently "fixed" beyond what was asked.
+// --------------------------------------------------------------------------- #
+
+function StatusPill({
+  tone,
+  label,
+  isError,
+  isFetching,
+}: {
+  tone: PillTone;
+  label: string;
+  isError: boolean;
+  isFetching: boolean;
+}) {
   const toneClass: Record<PillTone, string> = {
     ok: "bg-signal-ok/15 text-signal-ok border-signal-ok/40",
     warning: "bg-signal-warning/15 text-signal-warning border-signal-warning/40",
@@ -71,11 +126,33 @@ function StatusPill({ tone, label }: { tone: PillTone; label: string }) {
     muted: "bg-signal-muted/15 text-signal-muted border-signal-muted/40",
   };
 
+  let dot: ReactNode;
+  if (isError) {
+    // Flat, static failure signal -- zero animation, by explicit ticket
+    // requirement. A pulsing dot for a dropped connection reads as "still
+    // happening"; a solid one reads as "stopped," the correct signal here.
+    dot = <span className="h-1.5 w-1.5 rounded-full bg-red-500" />;
+  } else if (isFetching) {
+    dot = (
+      <span className="relative inline-flex h-1.5 w-1.5">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-yellow-400 opacity-75" />
+        <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-yellow-500" />
+      </span>
+    );
+  } else {
+    dot = (
+      <span className="relative inline-flex h-1.5 w-1.5">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
+        <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-green-500" />
+      </span>
+    );
+  }
+
   return (
     <span
       className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wider ${toneClass[tone]}`}
     >
-      <span className="h-1.5 w-1.5 rounded-full bg-current" />
+      {dot}
       {label}
     </span>
   );
@@ -273,7 +350,7 @@ function MetricsPanel() {
 }
 
 export default function App() {
-  const { data, isLoading, isError, error, dataUpdatedAt } = useThreats();
+  const { data, isLoading, isFetching, isError, error, dataUpdatedAt } = useThreats();
 
   const [searchQuery, setSearchQuery] = useState("");
   const [riskFilter, setRiskFilter] = useState<RiskFilter>("all");
@@ -309,6 +386,8 @@ export default function App() {
           <StatusPill
             tone={isError ? "critical" : isLoading ? "muted" : "ok"}
             label={isError ? "Connection Fault" : isLoading ? "Syncing" : "Live"}
+            isError={isError}
+            isFetching={isFetching}
           />
         </div>
       </header>

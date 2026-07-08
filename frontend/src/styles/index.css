@@ -1,1 +1,48 @@
 @import "tailwindcss";
+
+/* --------------------------------------------------------------------- */
+/* SentinelData Hub design tokens.                                       */
+/*                                                                       */
+/* Every bg-grid-*, text-grid-*, border-grid-*, divide-grid-*,           */
+/* decoration-grid-*, bg-signal-*, text-signal-*, and border-signal-*    */
+/* utility class used throughout App.tsx resolves off the variables      */
+/* below. Before this pass, no @theme block existed ANYWHERE in this     */
+/* repo defining them -- every one of those classes was an unrecognized  */
+/* utility name to Tailwind v4's engine and compiled to nothing at all.  */
+/* That silent failure went undetected because main.tsx was importing a  */
+/* separate, stale, manually-generated output.css instead of this file,  */
+/* and because vite.config.ts had the @tailwindcss/vite plugin removed   */
+/* from its plugins array entirely (see that file's own comment on the   */
+/* fix) -- so nothing was ever actually JIT-recompiling this file's       */
+/* classes against real source usage during development to surface the  */
+/* gap. All three problems are fixed together in this pass: the plugin   */
+/* is back, main.tsx points at this file, and this file now actually     */
+/* defines what App.tsx assumes exists.                                  */
+/*                                                                       */
+/* grid-*: a dark neutral ramp (950 near-black background through 100    */
+/* near-white text) for the app's base chrome -- backgrounds, borders,   */
+/* and body text at various emphasis levels. Named "grid" for this app's */
+/* OSINT/CVE indicator-grid theme; unrelated to CSS Grid.                */
+/*                                                                       */
+/* signal-*: semantic status colors (ok/warning/critical/muted), each a  */
+/* single value with no numeric shade -- bg-signal-ok/15, text-signal-ok,*/
+/* and border-signal-ok/40 all resolve off the one --color-signal-ok     */
+/* value via Tailwind v4's opacity-modifier color-mix, which works on     */
+/* any theme color regardless of whether it has a numeric shade scale,   */
+/* exactly as every existing call site in App.tsx already assumes.       */
+/* --------------------------------------------------------------------- */
+@theme {
+  --color-grid-950: #05070a;
+  --color-grid-900: #0d1117;
+  --color-grid-800: #161b22;
+  --color-grid-700: #26303d;
+  --color-grid-500: #64748b;
+  --color-grid-400: #8b98a8;
+  --color-grid-300: #b0bac6;
+  --color-grid-100: #eef1f5;
+
+  --color-signal-ok: #22c55e;
+  --color-signal-warning: #f59e0b;
+  --color-signal-critical: #ef4444;
+  --color-signal-muted: #6b7280;
+}

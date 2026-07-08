@@ -197,7 +197,16 @@ class OSINTPipeline:
         """
         try:
             client = await self.http_client
-            response = await client.get(url)
+            # Explicit per-request timeout=10.0 -- tighter than, and
+            # independent of, the shared client's own timeout=15.0 (see
+            # http_client above). That client-level value already bounded
+            # every request routed through it, so nothing here was hanging
+            # indefinitely before this edit; this makes the bound visible
+            # at the actual call site instead of only inferable from client
+            # construction elsewhere in the file, and deliberately
+            # tightens it (15.0 -> 10.0) rather than just restating the
+            # same number under a different name.
+            response = await client.get(url, timeout=10.0)
 
             if response.is_redirect:
                 logger.error(
@@ -408,30 +417,60 @@ class OSINTPipeline:
         # pipeline's actual pandas 3.0.2 runtime. Without an explicit format,
         # pd.to_datetime infers ONE format from the first non-null value in the
         # column and then applies that literal format to every other value in
-        # the column. For RFC822-style dates ("Tue, 07 Jul 2026 10:15:00 GMT"),
-        # the weekday abbreviation ("Tue") is baked into the inferred format as
-        # a fixed literal, not recognized as a variable token -- so any other
-        # entry in the same batch landing on a different weekday fails to match
-        # that literal. Under errors="coerce" this failure is NOT surfaced as a
-        # UserWarning (confirmed: no warning fires under pandas 3.0.2, contrary
-        # to the assumption this ticket was raised under) -- it is swallowed
-        # into a bare NaT with zero diagnostic trail. Reproduced directly:
-        # feeding pandas two otherwise-valid RFC822 strings differing only by
-        # weekday, with errors="raise" instead of "coerce", surfaces:
-        #   ValueError: time data "Wed, 02 Jul 2026 10:15:00 GMT" doesn't match
+        # the column.
+        #
+        # CORRECTED characterization (a prior version of this comment said
+        # the trigger was simply "two entries with different weekdays" --
+        # that was imprecise, and the corrected version below was verified
+        # while building backend/tests/test_pipeline.py's regression test):
+        # the trigger is NOT "different weekday abbreviations are present in
+        # the batch." Two RFC822 strings with correct, internally-consistent
+        # weekday/date pairs (e.g. an actual Monday labeled "Mon" and an
+        # actual Wednesday labeled "Wed") parse together just fine regardless
+        # of how many distinct weekdays appear -- pandas correctly recognizes
+        # that position as a genuine %a token in that case. The actual
+        # trigger is narrower: it fires when the FIRST value pandas samples
+        # has an INTERNALLY INCONSISTENT weekday -- its weekday name does not
+        # match the weekday its own day/month/year actually fall on (e.g.
+        # "Tue, 06 Jul 2026 ..." when 06 Jul 2026 is genuinely a Monday).
+        # Reproduced directly with errors="raise" on such a value paired with
+        # a second, entirely correct entry:
+        #   ValueError: time data "Wed, 07 Jul 2026 09:00:00 GMT" doesn't match
         #   format "Tue, %d %b %Y %H:%M:%S GMT". You might want to try:
         #   - passing format if your strings have a consistent format;
         #   - passing format='ISO8601' if your strings are all ISO8601 but not
         #     necessarily in exactly the same format;
         #   - passing format='mixed', and the format will be inferred for each
         #     element individually.
+        # Note the guessed format literally froze "Tue" as a fixed character
+        # sequence rather than recognizing it as %a -- because that first
+        # value's own weekday/date consistency check failed, pandas couldn't
+        # confidently generalize that token, so it locked the ENTIRE batch to
+        # that broken literal for the rest of the parse. Every other entry,
+        # even ones with perfectly correct, self-consistent weekday/date
+        # pairs, then fails to match and silently becomes NaT under
+        # errors="coerce" -- with zero warning surfaced (confirmed: no
+        # UserWarning fires under pandas 3.0.2, contrary to the assumption
+        # this ticket was originally raised under).
+        #
+        # This is a realistic failure mode, not a contrived one: a weekday/
+        # date mismatch like this is exactly what a timezone-conversion bug
+        # in an upstream feed generator produces -- converting a local
+        # timestamp to UTC can shift the calendar date across midnight while
+        # the weekday name, derived earlier from the pre-conversion local
+        # date, never gets recomputed. One such malformed entry anywhere in a
+        # batch -- not necessarily the "worst" one, just whichever one pandas
+        # samples first -- silently corrupts the observed_at timestamp of
+        # every other, perfectly valid entry ingested in that same cycle.
+        #
         # Every NaT produced this way is silently backfilled below by
         # fillna(now()) -- meaning a real feed's published/updated timestamp
         # gets silently replaced with "whenever this batch happened to run",
         # with no error, no warning, and no log line pointing at the cause.
         # format="mixed" tells pandas to infer the format independently per
-        # element instead of locking onto the first value's literal shape,
-        # which eliminates this failure mode entirely.
+        # element instead of locking onto one sampled value's literal shape,
+        # which eliminates this failure mode entirely regardless of which
+        # entry (if any) happens to carry an inconsistent weekday.
         #
         # Longer-term, more robust alternative (out of scope for this ticket,
         # not implemented here): feedparser already exposes parsed
@@ -461,7 +500,28 @@ class OSINTPipeline:
         title_lower = df["title"].str.lower()
 
         # Assign risk conditions hierarchically via index alignment matching
-        critical_mask = desc_lower.str.contains("rce|critical|cve-2026|exploit", na=False) | \
+        #
+        # CVE year token is read dynamically from the system clock rather
+        # than hardcoded, so this doesn't silently stop matching current-
+        # year CVE mentions once the calendar rolls over (the previous
+        # "cve-2026" literal would have quietly gone stale on 2027-01-01 --
+        # no error, no log line, no warning, just a slow decay in how many
+        # indicators get flagged critical).
+        #
+        # datetime.now(timezone.utc).year, not datetime.now().year: every
+        # other clock read in this file (df["observed_at"] above,
+        # dispatch_webhook_alert's generated_at, _persist_indicators'
+        # written_at) is explicit UTC, and this should be no different. A
+        # naive datetime.now().year reads the HOST's local clock -- a
+        # worker running in UTC-8 still reports the outgoing year for the
+        # first 8 hours of UTC's January 1st. That's not cosmetic here:
+        # risk_score categorization is a security signal, not a timestamp
+        # rendered for a human, so it should not drift depending on which
+        # timezone happens to host this process. year is a 4-digit int
+        # interpolated directly into the pattern -- no re.escape needed, it
+        # carries no regex metacharacters.
+        current_cve_year = datetime.now(timezone.utc).year
+        critical_mask = desc_lower.str.contains(f"rce|critical|cve-{current_cve_year}|exploit", na=False) | \
                         title_lower.str.contains("rce|critical", na=False)
         high_mask = desc_lower.str.contains("high|zero-day|injection|malware", na=False) & ~critical_mask
         medium_mask = desc_lower.str.contains("medium|vulnerability|patch", na=False) & ~(critical_mask | high_mask)
@@ -523,29 +583,32 @@ class OSINTPipeline:
           it's created, rather than naive-and-implicitly-UTC-by-convention.
           This removes one more naive datetime.utcnow() call site from the
           codebase, consistent with the rest of this ticket's mandate.
-        - GET /api/v1/metrics' re-localization of MAX(ingested_at) in
-          main.py (`if latest_ingestion_time.tzinfo is None: replace(
-          tzinfo=timezone.utc)`) is unaffected either way: because the
-          SQLite driver round-trips the column as naive on read regardless
-          of how it was written, that value comes back naive whether
-          `written_at` was constructed as naive or aware, so the existing
-          re-localization-on-read logic continues to fire and remains
-          correct without modification.
-        - database/models.py's ingested_at column still declares
-          default=datetime.utcnow (naive) as its ORM-level default. That
-          default is never actually invoked for pipeline-written rows,
-          since this method always supplies an explicit "ingested_at":
-          written_at value in the upsert's values list -- the column
-          default only applies to rows inserted through the ORM without an
-          explicit value, which this code path never does. Reconciling
-          that column default's naive convention with the aware value
-          computed here is a database/models.py change and is out of this
-          ticket's pipeline.py-only scope; not touched here.
-        - Genuine DB-level tz-aware round-tripping (as opposed to this
-          in-memory-only explicitness) would require a custom SQLAlchemy
-          TypeDecorator on the ingested_at / published_date columns in
-          database/models.py. Flagged as a future recommendation, not
-          implemented in this pass.
+        - UPDATE (later pass): GET /api/v1/metrics' re-localization of
+          MAX(ingested_at) in main.py (`if latest_ingestion_time.tzinfo is
+          None: replace(tzinfo=timezone.utc)`) was unaffected by this change
+          when it landed, for the reason above -- SQLite round-trips a
+          column as naive on read regardless of how it was written. That
+          re-localization check is STILL there and still harmless, but a
+          later pass added database/models.py's UTCDateTime TypeDecorator
+          on both published_date and ingested_at, which now re-localizes to
+          UTC internally on every read through those columns. That makes
+          main.py's own check provably dead code for this column -- it will
+          never see a naive value again -- though it hasn't been removed
+          (still out of scope for whichever file is being touched at the
+          time; harmless to leave in place either way).
+        - UPDATE (later pass): database/models.py's ingested_at column
+          previously declared default=datetime.utcnow (naive) as its
+          ORM-level default, and there was no TypeDecorator giving these
+          columns genuine DB-level tz-aware round-tripping -- both were
+          flagged here as future recommendations. Both are now implemented:
+          database/models.py defines a UTCDateTime TypeDecorator (applied to
+          both published_date and ingested_at) and the default is now
+          `default=lambda: datetime.now(timezone.utc)`. That default still
+          practically never fires for pipeline-written rows, for the same
+          reason stated above -- this method always supplies an explicit
+          "ingested_at": written_at value in the upsert's values list, and
+          the column default only applies to a row inserted through the ORM
+          directly, bypassing this upsert path entirely.
 
         Return value semantics changed from the previous version: this
         returns the size of the upserted batch (insert OR update), not
@@ -621,11 +684,69 @@ class OSINTPipeline:
         """
         Pipeline entry point. Executes async network gathering, hands off payload
         processing to threads, and pipes validated structures back into Pydantic models.
+
+        CONCURRENCY NOTE -- read this before "fixing" it again: the fetch
+        step below already dispatches every feed URL's fetch_feed_data()
+        call concurrently, and always has. fetch_tasks is a list of
+        not-yet-awaited coroutines; asyncio.gather schedules ALL of them
+        onto the event loop together and returns only once every one has
+        completed -- a slow feed at index 0 does not block feed 1 from
+        starting, because nothing here awaits fetch_tasks[0] before
+        fetch_tasks[1] is even scheduled. This is the correct, idiomatic
+        pattern for a batch of independent I/O-bound async calls.
+        concurrent.futures.ThreadPoolExecutor would be a regression here,
+        not an upgrade: fetch_feed_data's actual I/O (client.get()) is
+        already non-blocking, cooperatively-scheduled async I/O on this one
+        event loop -- there is no blocking call anywhere in it for a
+        worker thread to usefully take over. Wrapping it in a thread pool
+        would add OS thread creation/context-switch overhead and a second,
+        redundant concurrency model (threads that would then need
+        run_coroutine_threadsafe or a duplicated client to call back into
+        asyncio at all) to solve a problem that does not exist here.
+
+        return_exceptions=True on the gather() call below IS a genuine,
+        previously-missing hardening -- the one real gap this pass closes.
+        fetch_feed_data already catches httpx.HTTPStatusError and
+        httpx.HTTPError internally and returns None instead of raising (see
+        that method's own docstring), but without return_exceptions=True,
+        ANY exception outside that specific hierarchy -- a bug introduced
+        in a future edit to fetch_feed_data, an unexpected non-httpx
+        exception surfacing from deep inside httpx's transport layer, a
+        cancellation propagating oddly -- would previously propagate
+        straight out of this gather() call, aborting every still-in-flight
+        fetch and killing the entire ingestion cycle over one anomalous
+        feed. That directly contradicted this pipeline's own stated
+        resilience goal (see test_partial_feed_failure_returns_surviving_
+        indicators) for every failure class OTHER than the two httpx ones
+        fetch_feed_data explicitly catches itself. With
+        return_exceptions=True, a raised exception is captured as a value
+        in raw_results instead of propagating, and is explicitly logged and
+        coerced to None below -- before reaching _parse_and_vectorize,
+        which already safely skips any falsy/None entry (see its own
+        `if not raw_payload: continue`) -- so an exception surviving this
+        far costs that one feed's data for this cycle, nothing more.
         """
         logger.info(f"Starting ingestion cycle across {len(self.target_feeds)} targets.")
 
         fetch_tasks = [self.fetch_feed_data(url) for url in self.target_feeds]
-        raw_payloads = await asyncio.gather(*fetch_tasks)
+        raw_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+        raw_payloads: List[Optional[str]] = []
+        for url, result in zip(self.target_feeds, raw_results):
+            if isinstance(result, BaseException):
+                # Anything landing here escaped fetch_feed_data's own
+                # httpx-specific handling -- logged with the feed URL
+                # attached, same discipline fetch_feed_data's own log lines
+                # already apply to the failure classes it catches itself,
+                # then normalized to None to match fetch_feed_data's
+                # existing None-on-failure contract exactly.
+                logger.error(
+                    "ingestion.feed_fetch_task_raised_unexpectedly",
+                    extra={"feed_url": url, "reason": str(result)},
+                )
+                raw_payloads.append(None)
+            else:
+                raw_payloads.append(result)
 
         # Offload heavy Pandas parsing and array manipulation to a background worker thread
         processed_df = await asyncio.to_thread(self._parse_and_vectorize, raw_payloads)
