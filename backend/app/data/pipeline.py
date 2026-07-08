@@ -31,20 +31,82 @@ class OSINTPipeline:
 
     @property
     async def http_client(self) -> httpx.AsyncClient:
-        """Safely fetches or initializes the HTTPX client pool using a double-check lock pattern."""
+        """Safely fetches or initializes the HTTPX client pool using a double-check lock pattern.
+
+        follow_redirects=False is a deliberate SSRF boundary, not an
+        oversight: this pipeline fetches URLs supplied via SENTINEL_FEED_URLS
+        and treats their response bodies as data, but the URLs themselves
+        are still "third party until proven otherwise." A malicious or
+        compromised feed origin can respond with a 3xx pointing at an
+        internal address (a cloud metadata endpoint, localhost, an internal
+        admin panel) to use this process's network position as an SSRF
+        proxy. With follow_redirects=True, httpx would transparently chase
+        that redirect and hand the internal response straight into the
+        ingestion pipeline. With it False, httpx returns the un-followed 3xx
+        response instead of raising -- see fetch_feed_data below, which
+        detects that explicitly via response.is_redirect and rejects it
+        rather than treating a bare "don't follow" flag as sufficient by
+        itself.
+        """
         if self._http_client is None:
             async with self._lock:
                 if self._http_client is None:
-                    self._http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+                    self._http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=False)
         return self._http_client
 
     async def fetch_feed_data(self, url: str) -> Optional[str]:
-        """Fetch raw XML/RSS data asynchronously."""
+        """Fetch raw XML/RSS data asynchronously.
+
+        Three distinct failure classes are handled here, each logged
+        differently on purpose -- collapsing them into one generic
+        "network failure" log line would hide which case actually occurred:
+
+        1. Redirect response (response.is_redirect). httpx will NOT chase
+           this automatically (follow_redirects=False on the shared
+           client), so it comes back as a normal, non-raising response
+           object rather than an exception. Treating a bare 3xx as "empty
+           feed, move on" would silently swallow what may be an SSRF probe
+           against internal infrastructure -- so it's detected explicitly
+           and logged as a rejected redirect, not absorbed as a non-event.
+        2. httpx.HTTPStatusError, raised by response.raise_for_status() for
+           4xx/5xx responses -- an upstream feed that is down, gone, or
+           misconfigured.
+        3. httpx.HTTPError (the transport-level superclass covering
+           httpx.HTTPStatusError, connection failures, timeouts, etc.) --
+           kept as a catch-all beneath the more specific handler above so a
+           transport failure never crashes the whole ingestion cycle.
+
+        In every case, a single feed failing returns None and the cycle
+        continues with whatever other feeds succeeded -- see run(), which
+        gathers all fetch_feed_data calls concurrently and only ever expects
+        Optional[str] results, never an exception, from this method.
+        """
         try:
             client = await self.http_client
             response = await client.get(url)
+
+            if response.is_redirect:
+                logger.error(
+                    "ingestion.feed_redirect_rejected",
+                    extra={
+                        "feed_url": url,
+                        "redirect_status": response.status_code,
+                        "redirect_location": response.headers.get("location", "<none>"),
+                    },
+                )
+                return None
+
             response.raise_for_status()
             return response.text
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "ingestion.feed_http_status_error",
+                extra={
+                    "feed_url": url,
+                    "status_code": exc.response.status_code,
+                },
+            )
+            return None
         except httpx.HTTPError as exc:
             logger.error(f"Network failure fetching feed {url}: {str(exc)}")
             return None
