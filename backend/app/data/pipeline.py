@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 from datetime import datetime, timezone
 import hashlib
 import uuid
@@ -19,6 +21,101 @@ from app.database.models import ThreatIndicatorModel
 # Explicit logging schema setup for system tracking
 logger = logging.getLogger("sentineldata.pipeline")
 
+
+async def dispatch_webhook_alert(indicators: List[ThreatIndicator]) -> None:
+    """
+    Fire-and-forget notifier for high-priority (risk_score >= 5.0) threats.
+
+    Module-level, not a method on OSINTPipeline -- and deliberately opens
+    its own short-lived httpx.AsyncClient rather than reusing
+    OSINTPipeline._http_client. That shared client's lifecycle is owned by
+    OSINTPipeline.close() (awaited once at app shutdown -- see main.py's
+    lifespan), and this function runs detached via asyncio.create_task()
+    with no ordering guarantee relative to that shutdown. Reusing a client
+    that might already be closed, or racing close() closing it mid-POST, is
+    a bug class this sidesteps entirely by not touching pipeline-owned
+    state. The cost is a new connection per alert batch instead of
+    connection reuse -- acceptable for a path that fires on critical-threat
+    detection, not on every request.
+
+    SENTINEL_WEBHOOK_URL is operator-configured (an env var set by whoever
+    deploys this), not attacker-supplied feed content -- so follow_redirects
+    =False here is defense-in-depth, not a fix for the same SSRF class the
+    feed-fetching client's follow_redirects=False addresses in
+    OSINTPipeline.http_client. It's still the safer default: a webhook
+    receiver silently 3xx-ing the POST elsewhere is not something to
+    auto-follow either, so redirects are rejected the same way feed
+    redirects are, for the same reason -- see the is_redirect check below.
+
+    Never raises. Every failure path is caught, logged at
+    ingestion.webhook_failed, and swallowed. Nothing awaits the task this
+    runs as; an exception that escaped here would surface only as an
+    "exception was never retrieved" warning at garbage-collection time,
+    which is strictly worse than handling it here.
+    """
+    webhook_url = os.environ.get("SENTINEL_WEBHOOK_URL", "").strip()
+    if not webhook_url or not indicators:
+        return
+
+    payload: Dict[str, Any] = {
+        "event": "sentinel.critical_threats_detected",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(indicators),
+        "threats": [
+            {
+                "id": indicator.id,
+                "title": indicator.title,
+                "source_url": indicator.source_url,
+                "risk_score": indicator.risk_score,
+                "observed_at": indicator.observed_at.isoformat(),
+            }
+            for indicator in indicators
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            response = await client.post(webhook_url, json=payload)
+
+            if response.is_redirect:
+                logger.error(
+                    "ingestion.webhook_failed",
+                    extra={
+                        "webhook_url": webhook_url,
+                        "critical_count": len(indicators),
+                        "reason": "webhook_receiver_returned_redirect",
+                        "redirect_status": response.status_code,
+                    },
+                )
+                return
+
+            response.raise_for_status()
+
+        logger.info(
+            "ingestion.webhook_sent",
+            extra={"webhook_url": webhook_url, "critical_count": len(indicators)},
+        )
+    except httpx.HTTPError as exc:
+        logger.error(
+            "ingestion.webhook_failed",
+            extra={
+                "webhook_url": webhook_url,
+                "critical_count": len(indicators),
+                "reason": str(exc),
+            },
+        )
+    except Exception:
+        # Last-resort safety net, not the primary handler -- see docstring:
+        # this task is never awaited by anything, so an escaped exception
+        # here would otherwise vanish into an unretrieved-exception warning
+        # instead of a log line anyone would actually see.
+        logger.error(
+            "ingestion.webhook_failed",
+            exc_info=True,
+            extra={"webhook_url": webhook_url, "critical_count": len(indicators)},
+        )
+
+
 class OSINTPipeline:
     """
     High-throughput asynchronous data pipeline for ingesting, processing,
@@ -29,6 +126,14 @@ class OSINTPipeline:
         # Implement lazy-loading properties protected by an atomic lock boundary
         self._http_client: Optional[httpx.AsyncClient] = None
         self._lock = asyncio.Lock()
+        # Holds references to in-flight webhook-alert tasks created via
+        # asyncio.create_task() in run(). This is not decorative -- asyncio
+        # does not keep a task alive on its own once nothing references it;
+        # a task created and immediately dropped can be garbage-collected
+        # before it finishes, silently killing the alert mid-flight. Each
+        # task removes itself via add_done_callback once it completes (see
+        # run()), so this set only ever holds genuinely in-flight tasks.
+        self._background_tasks: set = set()
 
     @property
     async def http_client(self) -> httpx.AsyncClient:
@@ -56,7 +161,15 @@ class OSINTPipeline:
         return self._http_client
 
     async def fetch_feed_data(self, url: str) -> Optional[str]:
-        """Fetch raw XML/RSS data asynchronously.
+        """Fetch raw feed data asynchronously.
+
+        Deliberately format-agnostic: this returns response.text regardless
+        of whether the body turns out to be XML/Atom/RSS or a JSON
+        vulnerability stream. Format detection happens downstream, per
+        payload, in _parse_and_vectorize / _extract_json_records -- not
+        here, and not by inspecting the URL or a Content-Type header,
+        neither of which reliably tells you what a third-party feed
+        actually sends.
 
         Three distinct failure classes are handled here, each logged
         differently on purpose -- collapsing them into one generic
@@ -112,17 +225,144 @@ class OSINTPipeline:
             logger.error(f"Network failure fetching feed {url}: {str(exc)}")
             return None
 
-    def _parse_and_vectorize(self, raw_xml_data: List[str]) -> pd.DataFrame:
+    def _extract_json_records(self, raw_payload: str) -> Optional[List[Dict[str, Any]]]:
         """
-        Parses raw feed text using feedparser inside a synchronous wrapper
-        optimized for downstream DataFrame vectorization.
+        Attempts to parse raw_payload as a JSON vulnerability stream and map
+        it into the same intermediate record shape the feedparser path
+        below already builds: {title, description, source_url,
+        published_raw}. That shared shape is what lets JSON- and XML/Atom-
+        sourced entries flow through the exact same downstream
+        deduplication, risk-scoring, and batch-upsert code in
+        _process_batch/_persist_indicators without either path needing to
+        know the other exists.
+
+        json.loads is the parser used here -- not eval(), not a YAML
+        loader, nothing with an execution or object-construction surface.
+        That is what makes this "safely" parsed: a malformed or hostile
+        JSON payload can, at worst, fail to parse or produce data this
+        function then validates key-by-key: it cannot execute code or
+        instantiate arbitrary Python objects the way an unsafe deserializer
+        could.
+
+        Return value carries three distinct outcomes, and callers must not
+        collapse them:
+          - None: raw_payload is not valid JSON at all -- "try the
+            XML/Atom feedparser path instead."
+          - [] (empty list): raw_payload IS valid JSON, but contained zero
+            usable entries (empty array, or every entry missing a
+            mappable title/source_url). This must NOT fall through to
+            feedparser -- feedparser fed a JSON string will not raise, it
+            will just also return zero entries, but treating a real (if
+            empty) JSON response as "maybe it's actually XML" is the wrong
+            fallback for the wrong reason.
+          - non-empty list: usable records, appended into the same batch
+            feedparser entries populate.
+
+        Schema assumption, stated rather than silently guessed: there is no
+        JSON feed schema specification anywhere in this project to conform
+        to, so this maps the field names a vulnerability-stream API is
+        most likely to use, not a confirmed contract. Top level is either a
+        bare JSON array of entries, or an object with the array under one
+        of a handful of common wrapper keys (vulnerabilities/items/results/
+        data), or -- if none of those match -- a single JSON object is
+        treated as one entry rather than discarded outright. Per-entry key
+        aliases: title <- title/name/cve_id; description <-
+        description/summary/details; source_url <- url/link/reference;
+        published_raw <- published/date/timestamp/modified. Confirm these
+        against whatever real JSON feed(s) SENTINEL_FEED_URLS ends up
+        pointing at -- an entry using different key names is logged and
+        skipped, not crashed, but also not silently mis-mapped.
+        """
+        try:
+            parsed_json = json.loads(raw_payload)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        if isinstance(parsed_json, list):
+            raw_entries = parsed_json
+        elif isinstance(parsed_json, dict):
+            raw_entries = None
+            for wrapper_key in ("vulnerabilities", "items", "results", "data"):
+                candidate = parsed_json.get(wrapper_key)
+                if isinstance(candidate, list):
+                    raw_entries = candidate
+                    break
+            if raw_entries is None:
+                raw_entries = [parsed_json]
+        else:
+            # A JSON scalar (number, string, bool, null) has no usable
+            # vulnerability-entry structure at all.
+            return []
+
+        records: List[Dict[str, Any]] = []
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+
+            title = entry.get("title") or entry.get("name") or entry.get("cve_id")
+            source_url = entry.get("url") or entry.get("link") or entry.get("reference")
+            if not title or not source_url:
+                # Both are non-optional on ThreatIndicator -- skip here,
+                # with the actual missing-key context, rather than pass an
+                # incomplete record through to fail Pydantic validation
+                # later with a much less useful error further from its
+                # actual cause.
+                logger.warning(
+                    "ingestion.json_entry_missing_required_fields",
+                    extra={"entry_keys": list(entry.keys())},
+                )
+                continue
+
+            description = (
+                entry.get("description")
+                or entry.get("summary")
+                or entry.get("details")
+                or ""
+            )
+            published_raw = (
+                entry.get("published")
+                or entry.get("date")
+                or entry.get("timestamp")
+                or entry.get("modified")
+            )
+
+            records.append({
+                "title": title,
+                "description": description,
+                "source_url": source_url,
+                "published_raw": published_raw,
+            })
+
+        return records
+
+    def _parse_and_vectorize(self, raw_feed_payloads: List[str]) -> pd.DataFrame:
+        """
+        Parses each raw feed payload as either a JSON vulnerability stream
+        or an XML/Atom/RSS feed (via feedparser), and vectorizes the
+        combined result for downstream processing.
+
+        Format is detected per payload, not per feed URL: fetch_feed_data
+        (see above) is intentionally content-format-agnostic -- it fetches
+        and returns raw text regardless of what's on the other end, since
+        deciding "is this JSON or XML" from a URL string alone would be
+        guessing. _extract_json_records is tried first for each payload;
+        only a payload that is NOT valid JSON at all falls through to
+        feedparser. A payload cannot be both -- valid JSON is never valid
+        XML/Atom and vice versa -- so there's no double-parsing or
+        format-preference ambiguity here.
         """
         extracted_records = []
 
-        for raw_xml in raw_xml_data:
-            if not raw_xml:
+        for raw_payload in raw_feed_payloads:
+            if not raw_payload:
                 continue
-            parsed = feedparser.parse(raw_xml)
+
+            json_records = self._extract_json_records(raw_payload)
+            if json_records is not None:
+                extracted_records.extend(json_records)
+                continue
+
+            parsed = feedparser.parse(raw_payload)
             for entry in parsed.entries:
                 extracted_records.append({
                     "title": entry.get("title", ""),
@@ -346,12 +586,68 @@ class OSINTPipeline:
         # Offloaded to a worker thread -- see _persist_indicators docstring for why
         # this can no longer run inline on the event loop.
         if validated_indicators:
-            await asyncio.to_thread(self._persist_indicators, validated_indicators)
+            written_count = await asyncio.to_thread(self._persist_indicators, validated_indicators)
+
+            # Webhook dispatch is scheduled here, in run(), deliberately NOT
+            # inside _persist_indicators. _persist_indicators executes on a
+            # worker thread via asyncio.to_thread above and has no running
+            # event loop of its own -- asyncio.create_task() calls
+            # asyncio.get_running_loop() internally, and calling it from
+            # that thread raises RuntimeError. Worse, _persist_indicators'
+            # own try/except would catch that RuntimeError and log
+            # "Database persistence sub-cycle failed" even though the batch
+            # upsert had already committed successfully -- misreporting a
+            # webhook-scheduling bug as a storage failure. run() is already
+            # executing on the event loop, so this is where task creation
+            # can actually succeed.
+            #
+            # Gating on written_count > 0 means a webhook only fires for
+            # threats that were genuinely persisted this cycle -- if the
+            # upsert rolled back, _persist_indicators returns 0 and nothing
+            # gets alerted on, rather than claiming threats were "ingested
+            # or updated" when the write that would have done so failed.
+            if written_count > 0:
+                critical_indicators = [
+                    indicator for indicator in validated_indicators
+                    if indicator.risk_score >= 5.0
+                ]
+                if critical_indicators:
+                    # asyncio.create_task(), not await: a slow or hanging
+                    # webhook receiver must not add latency to the
+                    # /api/v1/threats response, which already has its own
+                    # SENTINEL_INGESTION_TIMEOUT_SECONDS budget (see
+                    # main.py) for actual ingestion work -- notification
+                    # delivery is a side effect of a successful cycle, not
+                    # part of what that timeout should be spent on.
+                    #
+                    # The task is tracked in self._background_tasks and
+                    # removes itself on completion -- see __init__ and
+                    # close() for why a bare, unreferenced create_task()
+                    # call would be a real (if intermittent) bug here.
+                    webhook_task = asyncio.create_task(
+                        dispatch_webhook_alert(critical_indicators)
+                    )
+                    self._background_tasks.add(webhook_task)
+                    webhook_task.add_done_callback(self._background_tasks.discard)
 
         logger.info(f"Ingestion lifecycle completed. Emitted {len(validated_indicators)} validated threat vectors.")
         return validated_indicators
 
     async def close(self):
-        """Gracefully release HTTP connections."""
+        """Gracefully release HTTP connections and any still-pending webhook tasks.
+
+        Cancels rather than awaits-to-completion any in-flight webhook
+        alerts: at shutdown, a webhook that hasn't finished should not
+        block process exit, and asyncio.gather(..., return_exceptions=True)
+        below both waits for the cancellation to actually land and prevents
+        an unrelated "Task was destroyed but it is pending" warning at
+        interpreter teardown -- a cosmetic issue, but one that's cheap to
+        avoid given _background_tasks already exists for this exact
+        purpose.
+        """
+        if self._background_tasks:
+            for task in list(self._background_tasks):
+                task.cancel()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
         if self._http_client is not None:
             await self._http_client.aclose()
