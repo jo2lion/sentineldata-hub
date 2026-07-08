@@ -207,6 +207,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.pipeline = pipeline
         app.state.api_key = api_key
         app.state.ingestion_timeout_seconds = ingestion_timeout
+        app.state.feed_count = len(feed_targets)
 
         logger.info(
             "startup.complete",
@@ -340,8 +341,8 @@ async def get_threats(request: Request) -> list[ThreatIndicator]:
 
     if len(indicators) == 0:
         logger.error(
-            "ingestion.wholesale_outage_empty_cycle", 
-            extra={"feed_count": len(feed_targets), "elapsed_ms": elapsed_ms}
+            "ingestion.wholesale_outage_empty_cycle",
+            extra={"feed_count": request.app.state.feed_count, "elapsed_ms": elapsed_ms}
         )
     else:
         logger.info(

@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+@theme {
+  /* Dark terminal / security-grid palette */
+  --color-grid-950: #05070a;
+  --color-grid-900: #0b0f14;
+  --color-grid-800: #121821;
+  --color-grid-700: #1c2530;
+  --color-grid-500: #3a4a5c;
+  --color-grid-300: #7c93a8;
+  --color-grid-100: #d7e2ea;
+
+  /* Status/alert signal colors — kept distinct from the grid palette so
+     severity states are never confused with neutral chrome. */
+  --color-signal-critical: #ff3b4e;
+  --color-signal-warning: #ffb020;
+  --color-signal-ok: #21e6a1;
+  --color-signal-muted: #4b5b6b;
+
+  --font-mono-terminal: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    font-family: var(--font-mono-terminal);
+  }
+}

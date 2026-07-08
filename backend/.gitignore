@@ -1,0 +1,19 @@
+# Ignore local Python virtual environments
+.venv/
+env/
+ENV/
+
+# Ignore compiled Python bytecode (clears up cache clutter)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore local test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ignore local environment variables and secret tokens
+.env
+.env.local

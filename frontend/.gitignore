@@ -1,0 +1,15 @@
+# Block the massive node dependencies tree
+node_modules/
+
+# Block local production build outputs
+dist/
+
+# Block local environment credential tokens
+.env.local
+.env.*.local
+
+# Block diagnostic logs and OS-specific metadata
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
