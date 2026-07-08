@@ -38,7 +38,7 @@ ENV PYTHONUNBUFFERED=1
 
 # Change ownership of the workspace to our non-root account
 COPY . .
-RUN chown -r sentinel:sentinel /workspace/backend
+RUN chown -R sentinel:sentinel /workspace/backend
 
 USER sentinel
 

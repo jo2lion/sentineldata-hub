@@ -1,19 +1,18 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import tailwindcss from '@tailwindcss/vite'
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react()], // Temporarily removed tailwindcss() from here to unblock server boot
   server: {
-    host: '127.0.0.1', // Forces Vite to use IPv4 loopback explicitly
+    host: '127.0.0.1',
     port: 5173,
-    strictPort: false, // If 5173 is locked, automatically move to 5174 instead of crashing
+    strictPort: false,
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
-        secure: false,
+        secure: false
       }
     }
   }

@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import type { ThreatIndicator } from "./types/threat";
 
 // --------------------------------------------------------------------------- #
 // SECURITY — read before this goes anywhere near a real deployment.
@@ -14,27 +15,9 @@ import { useQuery } from "@tanstack/react-query";
 // authenticates via session/cookie instead. Do not skip this decision.
 // --------------------------------------------------------------------------- #
 
-/**
- * TEMPORARY SHAPE. This is NOT sourced from the real Pydantic ThreatIndicator
- * model — that file (backend/app/models/threat.py) has never been shared in
- * this thread. Replace this the moment src/types/threat.ts exists for real,
- * and update every reference below. Named distinctly (not `ThreatIndicator`)
- * specifically so it can't be mistaken for the verified type once that
- * exists.
- */
-interface PlaceholderThreatIndicator {
-  indicator_id: string;
-  indicator_type: string;
-  value: string;
-  source: string;
-  first_seen: string;
-  confidence: number;
-  tags: string[];
-}
-
 const API_KEY = import.meta.env.VITE_API_KEY;
 
-async function fetchThreats(): Promise<PlaceholderThreatIndicator[]> {
+async function fetchThreats(): Promise<ThreatIndicator[]> {
   const response = await fetch("/api/v1/threats", {
     headers: API_KEY ? { "X-API-Key": API_KEY } : {},
   });
@@ -43,7 +26,7 @@ async function fetchThreats(): Promise<PlaceholderThreatIndicator[]> {
     throw new Error(`GET /api/v1/threats failed with status ${response.status}: ${response.statusText}`);
   }
 
-  return (await response.json()) as PlaceholderThreatIndicator[];
+  return (await response.json()) as ThreatIndicator[];
 }
 
 function useThreats() {
@@ -75,10 +58,6 @@ function StatusPill({ tone, label }: { tone: PillTone; label: string }) {
 }
 
 function OutageBanner() {
-  // Explicit, high-visibility handling of the len(indicators) == 0 case —
-  // matches the backend's deliberate design: total outage returns 200 with
-  // an empty list, not an error. Silently rendering "0 rows" here would be
-  // exactly the failure mode that design decision was reviewed to avoid.
   return (
     <div
       role="alert"
@@ -100,9 +79,10 @@ function OutageBanner() {
   );
 }
 
-function confidenceTone(confidence: number): string {
-  if (confidence >= 0.75) return "text-signal-critical";
-  if (confidence >= 0.4) return "text-signal-warning";
+function riskTone(riskScore: number): string {
+  if (riskScore >= 5.0) return "text-signal-critical";
+  if (riskScore >= 4.0) return "text-signal-warning";
+  if (riskScore >= 3.0) return "text-signal-warning/70";
   return "text-signal-ok";
 }
 
@@ -151,24 +131,41 @@ export default function App() {
               <table className="w-full text-left text-sm">
                 <thead className="bg-grid-800 text-grid-300">
                   <tr>
-                    <th className="px-4 py-2 font-medium">Type</th>
-                    <th className="px-4 py-2 font-medium">Value</th>
-                    <th className="px-4 py-2 font-medium">Source</th>
-                    <th className="px-4 py-2 font-medium">First Seen</th>
-                    <th className="px-4 py-2 font-medium">Confidence</th>
+                    <th className="px-4 py-3 font-medium">Title</th>
+                    <th className="px-4 py-3 font-medium">Description</th>
+                    <th className="px-4 py-3 font-medium">Source</th>
+                    <th className="px-4 py-3 font-medium">Observed At</th>
+                    <th className="px-4 py-3 font-medium">Risk</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-grid-700">
                   {data.map((indicator) => (
-                    <tr key={indicator.indicator_id} className="hover:bg-grid-800/60">
-                      <td className="px-4 py-2 font-mono text-grid-100">{indicator.indicator_type}</td>
-                      <td className="px-4 py-2 font-mono text-grid-100">{indicator.value}</td>
-                      <td className="px-4 py-2 text-grid-300">{indicator.source}</td>
-                      <td className="px-4 py-2 text-grid-300">
-                        {new Date(indicator.first_seen).toLocaleString()}
+                    <tr key={indicator.id} className="hover:bg-grid-800/60 align-top">
+                      <td className="px-4 py-3 font-mono text-grid-100 whitespace-nowrap">{indicator.title}</td>
+                      <td className="px-4 py-3 text-grid-300">
+                        {/* Safe HTML Ingestion Rendering Core Block */}
+                        <div 
+                          className="prose prose-invert text-sm max-w-none space-y-2 
+                                     [&_a]:text-blue-400 [&_a]:underline hover:[&_a]:text-blue-300
+                                     [&_ul]:list-disc [&_ul]:pl-5 [&_li]:mt-1"
+                          dangerouslySetInnerHTML={{ __html: indicator.description }} 
+                        />
                       </td>
-                      <td className={`px-4 py-2 font-mono ${confidenceTone(indicator.confidence)}`}>
-                        {(indicator.confidence * 100).toFixed(0)}%
+                      <td className="px-4 py-3 text-grid-300">
+                        <a
+                          href={indicator.source_url}
+                          target="_blank"
+                          rel="noreferrer noopener"
+                          className="underline decoration-grid-500 hover:text-grid-100"
+                        >
+                          source
+                        </a>
+                      </td>
+                      <td className="px-4 py-3 text-grid-300 whitespace-nowrap">
+                        {new Date(indicator.observed_at).toLocaleString()}
+                      </td>
+                      <td className={`px-4 py-3 font-mono ${riskTone(indicator.risk_score)}`}>
+                        {indicator.risk_score.toFixed(1)}
                       </td>
                     </tr>
                   ))}

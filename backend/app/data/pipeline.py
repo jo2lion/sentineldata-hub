@@ -20,7 +20,7 @@ logger = logging.getLogger("sentineldata.pipeline")
 
 class OSINTPipeline:
     """
-    High-throughput asynchronous data pipeline for ingesting, processing, 
+    High-throughput asynchronous data pipeline for ingesting, processing,
     and validating unstructured OSINT and CVE threat streams.
     """
     def __init__(self, target_feeds: List[str]):
@@ -51,11 +51,11 @@ class OSINTPipeline:
 
     def _parse_and_vectorize(self, raw_xml_data: List[str]) -> pd.DataFrame:
         """
-        Parses raw feed text using feedparser inside a synchronous wrapper 
+        Parses raw feed text using feedparser inside a synchronous wrapper
         optimized for downstream DataFrame vectorization.
         """
         extracted_records = []
-        
+
         for raw_xml in raw_xml_data:
             if not raw_xml:
                 continue
@@ -67,29 +67,39 @@ class OSINTPipeline:
                     "source_url": entry.get("link", ""),
                     "published_raw": entry.get("published", entry.get("updated", None))
                 })
-        
+
         if not extracted_records:
             return pd.DataFrame()
 
-        # Enforce native Pandas 3.x PyArrow backend string storage
+        # Enforce native Pandas 3.x PyArrow backend string storage (project directive:
+        # "Always implement native Pandas 3.x string storage mechanisms backed by
+        # PyArrow (string[pyarrow]) to guarantee zero memory overhead" -- this was
+        # previously "string[python]", the opposite of that directive.
         df = pd.DataFrame(extracted_records)
         df = df.astype({
-            "title": "string[python]",
-            "description": "string[python]",
-            "source_url": "string[python]"
+            "title": "string[pyarrow]",
+            "description": "string[pyarrow]",
+            "source_url": "string[pyarrow]"
         })
         return df
 
     def _process_batch(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Executes vectorized deduplication, deterministic ID assignment, 
+        Executes vectorized deduplication, deterministic ID assignment,
         and high-speed risk metric calculations.
         """
         if df.empty:
             return df
 
-        # 1. Clean and normalize temporal features to UTC
-        df["observed_at"] = pd.to_datetime(df["published_raw"], errors="coerce")
+        # 1. Clean and normalize temporal features to UTC.
+        # utc=True is required, not optional: without it, pd.to_datetime infers
+        # tz-awareness per-value from whatever offset (or lack of one) each feed's
+        # date string happens to carry. A single feed mixing "+0000"-suffixed and
+        # bare timestamps produces a column that is neither reliably naive nor
+        # reliably aware, which is exactly the ambiguity ThreatIndicator.observed_at
+        # now explicitly rejects. utc=True forces every parsed value to a single,
+        # unambiguous UTC-aware representation up front.
+        df["observed_at"] = pd.to_datetime(df["published_raw"], errors="coerce", utc=True)
         df["observed_at"] = df["observed_at"].fillna(datetime.now(timezone.utc))
 
         # 2. Compute Deterministic UUIDv5 identifiers from string payload hashes
@@ -98,14 +108,14 @@ class OSINTPipeline:
             hash_md5 = hashlib.md5(payload_bytes).digest()
             return str(uuid.uuid5(uuid.NAMESPACE_URL, hash_md5.hex()))
 
-        df["indicator_id"] = df.apply(generate_deterministic_uuid, axis=1).astype("string[python]")
+        df["indicator_id"] = df.apply(generate_deterministic_uuid, axis=1).astype("string[pyarrow]")
 
         # 3. Vectorized Deduplication based on calculated unique hashes
         df = df.drop_duplicates(subset=["indicator_id"], keep="first")
 
         # 4. Vectorized Risk Scoring Matrix based on text evaluation
-        df["risk_score"] = 1.0 
-        
+        df["risk_score"] = 1.0
+
         desc_lower = df["description"].str.lower()
         title_lower = df["title"].str.lower()
 
@@ -121,16 +131,60 @@ class OSINTPipeline:
 
         return df
 
+    def _persist_indicators(self, validated_indicators: List[ThreatIndicator]) -> int:
+        """
+        Synchronous SQLAlchemy ORM write path. Deliberately NOT async -- this
+        runs on a worker thread via asyncio.to_thread (see run()), never
+        directly on the event loop. Calling this inline from async code
+        (as it previously was) blocks every other concurrent request on the
+        process for the duration of every DB round-trip in the loop below.
+
+        Known follow-up, not fixed here: this is one SELECT per candidate
+        indicator (N+1). For a genuinely high-throughput pipeline this should
+        become a single batched existence check (SELECT id WHERE id IN (...))
+        or an INSERT ... ON CONFLICT DO NOTHING upsert. Left as-is because
+        that's a real design decision (batch size, conflict semantics), not
+        a one-line fix -- flagging rather than silently changing behavior.
+        """
+        stored_count = 0
+        db: Session = SessionLocal()
+        try:
+            for indicator in validated_indicators:
+                exists = db.query(ThreatIndicatorModel).filter(ThreatIndicatorModel.id == indicator.id).first()
+                if not exists:
+                    db_record = ThreatIndicatorModel(
+                        id=indicator.id,
+                        title=indicator.title,
+                        link=indicator.source_url,
+                        summary=indicator.description,
+                        published_date=indicator.observed_at,
+                        risk_score=indicator.risk_score
+                    )
+                    db.add(db_record)
+                    stored_count += 1
+
+            if stored_count > 0:
+                db.commit()
+                logger.info(f"Database sync complete. Saved {stored_count} new indicators to SQLite.")
+        except Exception:
+            db.rollback()
+            logger.error("Database persistence sub-cycle failed.", exc_info=True)
+            # Fail-open: don't crash the network request if storage hits a localized snag
+        finally:
+            db.close()
+
+        return stored_count
+
     async def run(self) -> List[ThreatIndicator]:
         """
-        Pipeline entry point. Executes async network gathering, hands off payload 
+        Pipeline entry point. Executes async network gathering, hands off payload
         processing to threads, and pipes validated structures back into Pydantic models.
         """
         logger.info(f"Starting ingestion cycle across {len(self.target_feeds)} targets.")
-        
+
         fetch_tasks = [self.fetch_feed_data(url) for url in self.target_feeds]
         raw_payloads = await asyncio.gather(*fetch_tasks)
-        
+
         # Offload heavy Pandas parsing and array manipulation to a background worker thread
         processed_df = await asyncio.to_thread(self._parse_and_vectorize, raw_payloads)
         optimized_df = await asyncio.to_thread(self._process_batch, processed_df)
@@ -157,36 +211,11 @@ class OSINTPipeline:
                 logger.error(f"Pydantic Validation Guard Rejected Row {row.get('indicator_id')}: {val_err.json()}")
                 continue
 
-        # --- PHASE 5: PERSISTENCE ENGINE ENGINE ---
-        # Write validated structures straight into the SQLite Relational Engine
+        # --- PHASE 5: PERSISTENCE ENGINE ---
+        # Offloaded to a worker thread -- see _persist_indicators docstring for why
+        # this can no longer run inline on the event loop.
         if validated_indicators:
-            db: Session = SessionLocal()
-            try:
-                stored_count = 0
-                for indicator in validated_indicators:
-                    # Idempotency guard: Prevent duplicating items using UUIDv5 matching
-                    exists = db.query(ThreatIndicatorModel).filter(ThreatIndicatorModel.id == indicator.id).first()
-                    if not exists:
-                        db_record = ThreatIndicatorModel(
-                            id=indicator.id,
-                            title=indicator.title,
-                            link=indicator.source_url,
-                            summary=indicator.description,
-                            published_date=indicator.observed_at,
-                            risk_score=indicator.risk_score
-                        )
-                        db.add(db_record)
-                        stored_count += 1
-                
-                if stored_count > 0:
-                    db.commit()
-                    logger.info(f"Database sync complete. Saved {stored_count} new indicators to SQLite.")
-            except Exception:
-                db.rollback()
-                logger.error("Database persistence sub-cycle failed.", exc_info=True)
-                # Fail-open: don't crash the network request if storage hits a localized snag
-            finally:
-                db.close()
+            await asyncio.to_thread(self._persist_indicators, validated_indicators)
 
         logger.info(f"Ingestion lifecycle completed. Emitted {len(validated_indicators)} validated threat vectors.")
         return validated_indicators
