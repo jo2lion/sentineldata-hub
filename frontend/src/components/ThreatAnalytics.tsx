@@ -15,7 +15,12 @@ import {
 } from "recharts";
 import type { ThreatIndicator } from "../types/threat";
 import type { SeverityTier } from "../lib/severity";
-import { SEVERITY_TIERS, classifySeverityTier, SEVERITY_TIER_CHART_COLOR } from "../lib/severity";
+import {
+  SEVERITY_TIERS,
+  classifySeverityTier,
+  SEVERITY_TIER_CHART_COLOR,
+  SEVERITY_TIER_TEXT_CLASS,
+} from "../lib/severity";
 
 // --------------------------------------------------------------------------- #
 // Threat Analytics -- Threat Velocity (cumulative time series) + Risk
@@ -220,7 +225,45 @@ function ThreatVelocityChart({ indicators }: { indicators: ThreatIndicator[] }) 
   );
 }
 
-function RiskCompositionChart({ indicators }: { indicators: ThreatIndicator[] }) {
+// --------------------------------------------------------------------------- #
+// Click-to-filter cross-filtering (this pass)
+//
+// selectedSeverity/onSeverityClick are threaded down from App.tsx's global
+// filter state -- this component does not own that state, only reports
+// clicks upward and reflects the current selection back visually. Clicking
+// the SAME slice twice is a toggle (App.tsx's handler clears the selection
+// on a repeat click of the active tier), so there is always a way to
+// deselect a slice without reaching for the separate "Clear Active
+// Filters" control.
+//
+// Dimming, not recoloring: per this project's dataviz anti-patterns
+// ("recolor-on-filter" -- a survivor's hue must never change when a
+// selection/filter is applied), the non-selected slices keep their EXACT
+// SEVERITY_TIER_CHART_COLOR hue and are only dimmed via fillOpacity. The
+// selected slice gets a full-opacity fill plus a light stroke ring for
+// emphasis -- this is the "highlight one, gray the rest" pattern the
+// anti-patterns doc explicitly endorses over inventing a new color for
+// the active state.
+//
+// Mouse-only, flagged not fixed: recharts' Pie/Cell sectors are SVG paths
+// with no native tab-stop or keydown handling in this hand-authored stub's
+// (and, to my knowledge, recharts' own) API surface. Unlike CveMetricsGrid's
+// plain HTML <tr> rows (which get a real role="button"/tabIndex/onKeyDown
+// treatment below in App.tsx), this donut's click-to-filter is mouse/touch
+// only today. A keyboard-reachable equivalent -- e.g. rendering the legend
+// entries as real <button> elements instead of recharts' own SVG legend --
+// is a real accessibility gap, not addressed in this pass.
+// --------------------------------------------------------------------------- #
+
+function RiskCompositionChart({
+  indicators,
+  selectedSeverity,
+  onSeverityClick,
+}: {
+  indicators: ThreatIndicator[];
+  selectedSeverity: SeverityTier | null;
+  onSeverityClick: (severity: SeverityTier) => void;
+}) {
   const slices = useMemo(() => buildSeverityComposition(indicators), [indicators]);
   const total = indicators.length;
 
@@ -235,6 +278,15 @@ function RiskCompositionChart({ indicators }: { indicators: ThreatIndicator[] })
       </p>
       <p className="mb-2 text-xs text-grid-400">
         {total} indicator{total === 1 ? "" : "s"} by severity tier
+        {selectedSeverity !== null && (
+          <>
+            {" "}
+            ·{" "}
+            <span className={SEVERITY_TIER_TEXT_CLASS[selectedSeverity]}>
+              filtering to {selectedSeverity}
+            </span>
+          </>
+        )}
       </p>
       <div className="h-64 w-full">
         <ResponsiveContainer width="100%" height="100%">
@@ -264,9 +316,21 @@ function RiskCompositionChart({ indicators }: { indicators: ThreatIndicator[] })
               paddingAngle={2}
               isAnimationActive={false}
             >
-              {slices.map((slice) => (
-                <Cell key={slice.tier} fill={SEVERITY_TIER_CHART_COLOR[slice.tier]} />
-              ))}
+              {slices.map((slice) => {
+                const isSelected = selectedSeverity === slice.tier;
+                const isDimmed = selectedSeverity !== null && !isSelected;
+                return (
+                  <Cell
+                    key={slice.tier}
+                    fill={SEVERITY_TIER_CHART_COLOR[slice.tier]}
+                    fillOpacity={isDimmed ? 0.35 : 1}
+                    stroke={isSelected ? "var(--color-grid-100)" : undefined}
+                    strokeWidth={isSelected ? 2 : 0}
+                    cursor="pointer"
+                    onClick={() => onSeverityClick(slice.tier)}
+                  />
+                );
+              })}
             </Pie>
           </PieChart>
         </ResponsiveContainer>
@@ -278,9 +342,13 @@ function RiskCompositionChart({ indicators }: { indicators: ThreatIndicator[] })
 export function ThreatAnalytics({
   indicators,
   isLoading,
+  selectedSeverity,
+  onSeverityClick,
 }: {
   indicators: ThreatIndicator[] | undefined;
   isLoading: boolean;
+  selectedSeverity: SeverityTier | null;
+  onSeverityClick: (severity: SeverityTier) => void;
 }) {
   // Gated on isLoading, NOT isFetching -- deliberately. isLoading is
   // TanStack Query's "no cached data yet" state (true only on the very
@@ -310,7 +378,11 @@ export function ThreatAnalytics({
   return (
     <div className="mb-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
       <ThreatVelocityChart indicators={safeIndicators} />
-      <RiskCompositionChart indicators={safeIndicators} />
+      <RiskCompositionChart
+        indicators={safeIndicators}
+        selectedSeverity={selectedSeverity}
+        onSeverityClick={onSeverityClick}
+      />
     </div>
   );
 }

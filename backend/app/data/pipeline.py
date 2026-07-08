@@ -22,6 +22,72 @@ from app.database.models import ThreatIndicatorModel
 logger = logging.getLogger("sentineldata.pipeline")
 
 
+def _summarize_critical_impact(indicators: List[ThreatIndicator]) -> Dict[str, Any]:
+    """
+    Builds the isolated, pre-computed impact-summary field for the critical
+    webhook payload -- deliberately NOT left for the webhook receiver to
+    derive by looping the raw `threats` array itself. Whatever is on the
+    other end of SENTINEL_WEBHOOK_URL (Slack, Discord, PagerDuty, a bare
+    logging sink) should not have to reimplement "how bad is this cycle"
+    from a list of records -- that's exactly the kind of derived logic that
+    quietly drifts between N different downstream consumers if it isn't
+    computed once, here, and shipped as data alongside the raw list.
+
+    Pure and side-effect-free -- no I/O, no logging -- safe to unit test
+    directly without any network mocking. Callers must pass an already-
+    filtered, non-empty critical (risk_score >= 5.0) list; this function
+    does not itself re-validate that (dispatch_webhook_alert does, at the
+    one call site that matters -- see its own docstring).
+    """
+    risk_scores = [indicator.risk_score for indicator in indicators]
+    distinct_sources = {indicator.source_url for indicator in indicators}
+    return {
+        "headline": (
+            f"{len(indicators)} critical-severity threat"
+            f"{'s' if len(indicators) != 1 else ''} detected this ingestion cycle"
+        ),
+        "highest_risk_score": max(risk_scores),
+        "distinct_source_count": len(distinct_sources),
+        "action_required": "Immediate triage required -- see `threats` for per-indicator detail.",
+    }
+
+
+def _render_critical_markdown(indicators: List[ThreatIndicator], impact_summary: Dict[str, Any]) -> str:
+    """
+    Markdown-formatted alert body, for any webhook receiver that renders
+    markdown directly (Slack/Discord/Mattermost-style `content` fields, a
+    generic markdown-aware alert router). This is an ADDITIONAL
+    representation alongside the structured `impact_summary`/`threats`
+    fields below, not a replacement for them -- a receiver that wants
+    structured data still has it; this is for the ones that just render a
+    text blob.
+
+    Deliberately kept to plain ATX '#'/'##' headings and '-' bullets -- no
+    receiver-specific syntax (Slack's own mrkdwn dialect, Discord embed
+    JSON) baked in here, since SENTINEL_WEBHOOK_URL's actual receiver is
+    operator-configured and unknown to this code. A receiver that needs
+    its own native format can still build it from the structured fields;
+    this string is a convenience, not the sole representation.
+    """
+    lines = [
+        "# \U0001F6A8 SENTINELDATA HUB -- CRITICAL THREAT ALERT",
+        "",
+        "## Impact Summary",
+        f"- {impact_summary['headline']}",
+        f"- Highest risk score this cycle: {impact_summary['highest_risk_score']:.1f}",
+        f"- Distinct sources involved: {impact_summary['distinct_source_count']}",
+        f"- {impact_summary['action_required']}",
+        "",
+        "## Threats",
+    ]
+    for indicator in indicators:
+        lines.append(
+            f"- **{indicator.title}** (risk {indicator.risk_score:.1f}) -- "
+            f"observed {indicator.observed_at.isoformat()} -- {indicator.source_url}"
+        )
+    return "\n".join(lines)
+
+
 async def dispatch_webhook_alert(indicators: List[ThreatIndicator]) -> None:
     """
     Fire-and-forget notifier for high-priority (risk_score >= 5.0) threats.
@@ -52,15 +118,76 @@ async def dispatch_webhook_alert(indicators: List[ThreatIndicator]) -> None:
     runs as; an exception that escaped here would surface only as an
     "exception was never retrieved" warning at garbage-collection time,
     which is strictly worse than handling it here.
+
+    CHANNEL-SEPARATION BOUNDARY (this pass): this is the ONLY function in
+    the pipeline that ever emits an outbound alert -- run() already filters
+    validated_indicators down to risk_score >= 5.0 before calling this (see
+    run()'s own comment), so Informational/Low/Medium threats never reach
+    here at all; they are persisted by _persist_indicators and nothing
+    else. That upstream filter is trusted for WHICH indicators get here,
+    but not blindly: the re-filter immediately below is a second,
+    independent enforcement of the exact same boundary at the one place
+    that actually renders "emergency"/"CRITICAL" into the payload, so a
+    future caller passing an unfiltered batch cannot silently mislabel a
+    Low/Medium threat as a critical emergency.
+
+    PAYLOAD FORMAT (this pass): previously a flat {event, generated_at,
+    count, threats} object. Now carries explicit emergency flags
+    (`emergency: true`, `priority: "CRITICAL"`), an isolated
+    `impact_summary` field pre-computed by _summarize_critical_impact
+    (not left for the receiver to derive from `threats`), and a `markdown`
+    field with ATX headings for any receiver that renders text directly.
+    `threats` itself is unchanged -- still the flat per-indicator list --
+    so anything already parsing that key against the old shape keeps
+    working; every other key here is additive.
+
+    DESIGN TRADE-OFF, stated rather than silently decided: this still
+    batches every critical indicator from one ingestion cycle into ONE
+    webhook POST, not one POST per indicator. "Standalone" in this
+    ticket's wording is read here as "a separate call/channel from DB
+    persistence" (true -- this function is never invoked for a
+    save-only cycle), not "one HTTP request per critical indicator."
+    Per-indicator dispatch was considered and rejected: a single feed
+    cycle that surfaces, say, 12 simultaneous critical CVEs would fire 12
+    near-simultaneous POSTs to the same receiver, which is a self-inflicted
+    webhook flood/rate-limit risk for zero gain in information -- the
+    batched payload's `impact_summary` and `markdown` sections already give
+    a receiver everything needed to raise 12 separate tickets on its own
+    side if that's the desired downstream behavior. If your receiver
+    genuinely requires one-alert-per-threat semantics, that's a real,
+    separate ask -- flagged here rather than guessed at.
     """
     webhook_url = os.environ.get("SENTINEL_WEBHOOK_URL", "").strip()
     if not webhook_url or not indicators:
         return
 
+    # Defense-in-depth re-filter -- see CHANNEL-SEPARATION BOUNDARY above.
+    # Costs nothing on the happy path (run() already only ever calls this
+    # with an all-critical list) and catches the one class of bug that
+    # would otherwise silently ship a false "CRITICAL"/"emergency" alert.
+    critical_only = [indicator for indicator in indicators if indicator.risk_score >= 5.0]
+    if len(critical_only) != len(indicators):
+        logger.warning(
+            "ingestion.webhook_received_non_critical_indicators",
+            extra={
+                "received_count": len(indicators),
+                "critical_count": len(critical_only),
+            },
+        )
+    if not critical_only:
+        return
+    indicators = critical_only
+
+    impact_summary = _summarize_critical_impact(indicators)
+
     payload: Dict[str, Any] = {
         "event": "sentinel.critical_threats_detected",
+        "emergency": True,
+        "priority": "CRITICAL",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "count": len(indicators),
+        "impact_summary": impact_summary,
+        "markdown": _render_critical_markdown(indicators, impact_summary),
         "threats": [
             {
                 "id": indicator.id,

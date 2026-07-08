@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { ChangeEvent, ReactNode } from "react";
+import type { ChangeEvent, KeyboardEvent, ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { DashboardMetrics, ThreatIndicator } from "./types/threat";
 import type { SeverityTier } from "./lib/severity";
@@ -435,7 +435,15 @@ function aggregateByYearAndSeverity(indicators: ThreatIndicator[]): YearSeverity
     .sort((a, b) => b.year - a.year); // most recent year first
 }
 
-function CveMetricsGrid({ indicators }: { indicators: ThreatIndicator[] | undefined }) {
+function CveMetricsGrid({
+  indicators,
+  selectedYear,
+  onYearClick,
+}: {
+  indicators: ThreatIndicator[] | undefined;
+  selectedYear: number | null;
+  onYearClick: (year: number) => void;
+}) {
   // Null-safe by construction: `indicators` is undefined during the
   // pre-first-response window (React Query has no cached data yet) and
   // during the isError path -- aggregateByYearAndSeverity always receives
@@ -475,22 +483,60 @@ function CveMetricsGrid({ indicators }: { indicators: ThreatIndicator[] | undefi
             </tr>
           </thead>
           <tbody className="divide-y divide-grid-800">
-            {rows.map((row) => (
-              <tr key={row.year}>
-                <td className="px-4 py-2 font-mono text-grid-100">{row.year}</td>
-                {SEVERITY_TIERS.map((tier) => (
+            {rows.map((row) => {
+              // Click-to-filter cross-filtering (this pass): a row sets
+              // App.tsx's global selectedYear -- clicking the ALREADY
+              // selected year toggles it back off (see App's
+              // handleYearSelect), so there's always a way to deselect a
+              // row without reaching for "Clear Active Filters".
+              //
+              // Highlight is applied via a background wash on the <tr>
+              // (background-color on a table row DOES render in every
+              // modern browser) plus a left accent border on the leading
+              // <td> specifically -- NOT a border on the <tr> itself.
+              // Borders on <tr> elements are unreliable across browsers
+              // under the default `border-collapse: separate` table model
+              // (many engines simply never paint them), so the accent
+              // lives on the cell, where border painting is guaranteed.
+              const isSelected = selectedYear === row.year;
+              return (
+                <tr
+                  key={row.year}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={isSelected}
+                  onClick={() => onYearClick(row.year)}
+                  onKeyDown={(event: KeyboardEvent<HTMLTableRowElement>) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onYearClick(row.year);
+                    }
+                  }}
+                  className={`cursor-pointer transition-colors hover:bg-grid-800/60 ${
+                    isSelected ? "bg-signal-ok/5" : ""
+                  }`}
+                >
                   <td
-                    key={tier}
-                    className={`px-4 py-2 text-right font-mono ${SEVERITY_TIER_TEXT_CLASS[tier]}`}
+                    className={`px-4 py-2 font-mono text-grid-100 ${
+                      isSelected ? "border-l-2 border-signal-ok pl-3" : ""
+                    }`}
                   >
-                    {row.counts[tier]}
+                    {row.year}
                   </td>
-                ))}
-                <td className="px-4 py-2 text-right font-mono font-semibold text-grid-100">
-                  {row.total}
-                </td>
-              </tr>
-            ))}
+                  {SEVERITY_TIERS.map((tier) => (
+                    <td
+                      key={tier}
+                      className={`px-4 py-2 text-right font-mono ${SEVERITY_TIER_TEXT_CLASS[tier]}`}
+                    >
+                      {row.counts[tier]}
+                    </td>
+                  ))}
+                  <td className="px-4 py-2 text-right font-mono font-semibold text-grid-100">
+                    {row.total}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
@@ -504,14 +550,84 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [riskFilter, setRiskFilter] = useState<RiskFilter>("all");
 
+  // --------------------------------------------------------------------- #
+  // Global cross-filter state (this pass): selectedYear / selectedSeverity
+  // are set by clicking a CveMetricsGrid row or a ThreatAnalytics donut
+  // sector respectively, and scope the main feed table below (see
+  // filteredData). Typed as `SeverityTier | null` here, not the ticket's
+  // literal `string | null` -- the value assigned is always one of exactly
+  // four known tier strings (never an arbitrary string), and every place
+  // that reads it (matching against classifySeverityTier's return type,
+  // indexing SEVERITY_TIER_TEXT_CLASS/SEVERITY_TIER_CHART_COLOR) already
+  // requires that exact union. A plain `string | null` would still satisfy
+  // every current call site but would also silently accept a typo'd tier
+  // name with zero compiler help -- the narrower type is strictly safer at
+  // no cost, same reasoning as prior tickets' UTC-vs-naive datetime calls.
+  //
+  // These are independent, orthogonal filters (a year selection does not
+  // require a severity selection, and vice versa), combined with logical
+  // AND in filteredData below alongside the pre-existing search/riskFilter
+  // dimensions -- FOUR filter dimensions can now be active simultaneously
+  // on the same list.
+  //
+  // Deliberately NOT re-applied to CveMetricsGrid's or ThreatAnalytics's
+  // own aggregations: selecting a year does not re-slice the severity
+  // donut to that year, and selecting a severity does not re-slice the
+  // year table to that tier. Both charts always aggregate the FULL
+  // (unfiltered) `data` array; only the feed list below narrows. This is
+  // a real, deliberate scope decision, not an oversight -- true two-way
+  // cross-filtering (each chart re-aggregating against the other's
+  // selection) is a legitimate pattern this project's own dataviz
+  // conventions would generally prefer ("all charts re-render against the
+  // same slice, so the numbers always agree"), but it introduces a real
+  // consistency question this ticket doesn't resolve: if selecting the
+  // Critical slice removed all non-Critical wedges from the donut itself,
+  // there would be nothing left to click to get back to High/Medium/Low
+  // without the separate Clear button. Keeping the charts as stable,
+  // always-full-context "selectors" and only slicing the list below
+  // sidesteps that, at the cost of the donut/grid never visually
+  // reflecting the OTHER filter dimension. Flagged, not silently decided.
+  const [selectedYear, setSelectedYear] = useState<number | null>(null);
+  const [selectedSeverity, setSelectedSeverity] = useState<SeverityTier | null>(null);
+
+  // Toggle semantics: clicking the currently-active selection clears it,
+  // matching the same "click again to deselect" affordance already given
+  // to CveMetricsGrid's rows and ThreatAnalytics' donut sectors visually
+  // (both re-render as "selected" only while their value === state).
+  const handleYearSelect = (year: number) => {
+    setSelectedYear((previous) => (previous === year ? null : year));
+  };
+  const handleSeveritySelect = (severity: SeverityTier) => {
+    setSelectedSeverity((previous) => (previous === severity ? null : severity));
+  };
+  const clearActiveFilters = () => {
+    setSelectedYear(null);
+    setSelectedSeverity(null);
+  };
+
   // Derived, not stored -- filteredData is always a pure function of
-  // (data, searchQuery, riskFilter). useMemo avoids recomputing the filter
-  // pass on unrelated re-renders (e.g. the metrics query refetching).
+  // (data, searchQuery, riskFilter, selectedYear, selectedSeverity).
+  // useMemo avoids recomputing the filter pass on unrelated re-renders
+  // (e.g. the metrics query refetching).
   const filteredData = useMemo(() => {
     if (!data) return [];
     const normalizedQuery = searchQuery.trim().toLowerCase();
     return data.filter((indicator) => {
       if (!matchesRiskFilter(indicator.risk_score, riskFilter)) return false;
+      // selectedSeverity uses the SAME 4-tier classifySeverityTier as the
+      // CveMetricsGrid/ThreatAnalytics aggregations it was clicked from --
+      // NOT riskFilter's separate 3-bucket scheme above. Both can be
+      // active at once (e.g. riskFilter="warning" AND
+      // selectedSeverity="Medium"), in which case they simply AND
+      // together; that can legitimately narrow the list to zero rows
+      // (handled by NoFilterMatchesNotice below) rather than being
+      // treated as a conflict to resolve.
+      if (selectedSeverity !== null && classifySeverityTier(indicator.risk_score) !== selectedSeverity) {
+        return false;
+      }
+      if (selectedYear !== null && new Date(indicator.observed_at).getFullYear() !== selectedYear) {
+        return false;
+      }
       if (!normalizedQuery) return true;
       // Both sides guarded against a null/undefined field slipping past the
       // TS contract at runtime -- see stripHtmlTags' comment above for why.
@@ -522,7 +638,7 @@ export default function App() {
         safeDescription.toLowerCase().includes(normalizedQuery)
       );
     });
-  }, [data, searchQuery, riskFilter]);
+  }, [data, searchQuery, riskFilter, selectedSeverity, selectedYear]);
 
   return (
     <div className="min-h-screen bg-grid-950 text-grid-100">
@@ -544,9 +660,38 @@ export default function App() {
       <main className="mx-auto max-w-6xl px-6 py-8">
         <MetricsPanel />
 
-        <CveMetricsGrid indicators={data} />
+        <CveMetricsGrid indicators={data} selectedYear={selectedYear} onYearClick={handleYearSelect} />
 
-        <ThreatAnalytics indicators={data} isLoading={isLoading} />
+        <ThreatAnalytics
+          indicators={data}
+          isLoading={isLoading}
+          selectedSeverity={selectedSeverity}
+          onSeverityClick={handleSeveritySelect}
+        />
+
+        {(selectedYear !== null || selectedSeverity !== null) && (
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-signal-ok/30 bg-signal-ok/5 px-4 py-2">
+            <p className="text-xs text-grid-100">
+              Filtering to
+              {selectedYear !== null && <span className="font-mono"> {selectedYear}</span>}
+              {selectedYear !== null && selectedSeverity !== null && " ·"}
+              {selectedSeverity !== null && (
+                <span className={`font-semibold ${SEVERITY_TIER_TEXT_CLASS[selectedSeverity]}`}>
+                  {" "}
+                  {selectedSeverity}
+                </span>
+              )}
+              . Clicking the same selection again also clears it.
+            </p>
+            <button
+              type="button"
+              onClick={clearActiveFilters}
+              className="whitespace-nowrap rounded-md border border-grid-700 bg-grid-900 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-grid-100 transition-colors hover:border-signal-ok hover:text-signal-ok"
+            >
+              Clear Active Filters
+            </button>
+          </div>
+        )}
 
         {isLoading && <p className="text-sm text-grid-300">Running ingestion cycle…</p>}
 
