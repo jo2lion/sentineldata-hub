@@ -402,7 +402,45 @@ class OSINTPipeline:
         # reliably aware, which is exactly the ambiguity ThreatIndicator.observed_at
         # now explicitly rejects. utc=True forces every parsed value to a single,
         # unambiguous UTC-aware representation up front.
-        df["observed_at"] = pd.to_datetime(df["published_raw"], errors="coerce", utc=True)
+        #
+        # format="mixed" is not a cosmetic warning suppressor -- omitting it is
+        # a silent data-corruption bug, verified empirically against this
+        # pipeline's actual pandas 3.0.2 runtime. Without an explicit format,
+        # pd.to_datetime infers ONE format from the first non-null value in the
+        # column and then applies that literal format to every other value in
+        # the column. For RFC822-style dates ("Tue, 07 Jul 2026 10:15:00 GMT"),
+        # the weekday abbreviation ("Tue") is baked into the inferred format as
+        # a fixed literal, not recognized as a variable token -- so any other
+        # entry in the same batch landing on a different weekday fails to match
+        # that literal. Under errors="coerce" this failure is NOT surfaced as a
+        # UserWarning (confirmed: no warning fires under pandas 3.0.2, contrary
+        # to the assumption this ticket was raised under) -- it is swallowed
+        # into a bare NaT with zero diagnostic trail. Reproduced directly:
+        # feeding pandas two otherwise-valid RFC822 strings differing only by
+        # weekday, with errors="raise" instead of "coerce", surfaces:
+        #   ValueError: time data "Wed, 02 Jul 2026 10:15:00 GMT" doesn't match
+        #   format "Tue, %d %b %Y %H:%M:%S GMT". You might want to try:
+        #   - passing format if your strings have a consistent format;
+        #   - passing format='ISO8601' if your strings are all ISO8601 but not
+        #     necessarily in exactly the same format;
+        #   - passing format='mixed', and the format will be inferred for each
+        #     element individually.
+        # Every NaT produced this way is silently backfilled below by
+        # fillna(now()) -- meaning a real feed's published/updated timestamp
+        # gets silently replaced with "whenever this batch happened to run",
+        # with no error, no warning, and no log line pointing at the cause.
+        # format="mixed" tells pandas to infer the format independently per
+        # element instead of locking onto the first value's literal shape,
+        # which eliminates this failure mode entirely.
+        #
+        # Longer-term, more robust alternative (out of scope for this ticket,
+        # not implemented here): feedparser already exposes parsed
+        # published_parsed / updated_parsed struct_time fields on each entry,
+        # which sidesteps re-parsing raw date strings through pandas' format
+        # inference altogether. Flagged for a future pass, not touched here.
+        df["observed_at"] = pd.to_datetime(
+            df["published_raw"], errors="coerce", utc=True, format="mixed"
+        )
         df["observed_at"] = df["observed_at"].fillna(datetime.now(timezone.utc))
 
         # 2. Compute Deterministic UUIDv5 identifiers from string payload hashes
@@ -468,13 +506,46 @@ class OSINTPipeline:
         wrote a row, insert or update -- leaving it stale on updates would
         make the dashboard's "Last DB write" lag behind real activity.
 
-        written_at uses naive UTC (datetime.utcnow(), not
-        datetime.now(timezone.utc)) to match the column's own
-        default=datetime.utcnow convention and the naive-datetime
-        assumption GET /api/v1/metrics already makes when re-localizing
-        MAX(ingested_at). Mixing naive and aware values in the same SQLite
-        DATETIME column would compound the naive-column issue already
-        flagged elsewhere, not fix it.
+        written_at now uses datetime.now(timezone.utc), an explicit,
+        timezone-aware UTC construction, in place of the previous naive
+        datetime.utcnow(). This is a deliberately narrow fix, and it is
+        important to be precise about what it does and does not change:
+
+        - On disk, this is a no-op. SQLAlchemy's SQLite DATETIME type has
+          no native timezone-aware column type; its bind processor formats
+          a value strictly from year/month/day/hour/minute/second/
+          microsecond and never reads .tzinfo at all. A naive and an aware
+          datetime representing the identical instant serialize to
+          byte-identical stored strings. Nothing about the database schema
+          or the bytes it holds changes as a result of this edit.
+        - What changes is in-memory intent at construction time: the value
+          assigned to `written_at` is now explicitly UTC-aware the moment
+          it's created, rather than naive-and-implicitly-UTC-by-convention.
+          This removes one more naive datetime.utcnow() call site from the
+          codebase, consistent with the rest of this ticket's mandate.
+        - GET /api/v1/metrics' re-localization of MAX(ingested_at) in
+          main.py (`if latest_ingestion_time.tzinfo is None: replace(
+          tzinfo=timezone.utc)`) is unaffected either way: because the
+          SQLite driver round-trips the column as naive on read regardless
+          of how it was written, that value comes back naive whether
+          `written_at` was constructed as naive or aware, so the existing
+          re-localization-on-read logic continues to fire and remains
+          correct without modification.
+        - database/models.py's ingested_at column still declares
+          default=datetime.utcnow (naive) as its ORM-level default. That
+          default is never actually invoked for pipeline-written rows,
+          since this method always supplies an explicit "ingested_at":
+          written_at value in the upsert's values list -- the column
+          default only applies to rows inserted through the ORM without an
+          explicit value, which this code path never does. Reconciling
+          that column default's naive convention with the aware value
+          computed here is a database/models.py change and is out of this
+          ticket's pipeline.py-only scope; not touched here.
+        - Genuine DB-level tz-aware round-tripping (as opposed to this
+          in-memory-only explicitness) would require a custom SQLAlchemy
+          TypeDecorator on the ingested_at / published_date columns in
+          database/models.py. Flagged as a future recommendation, not
+          implemented in this pass.
 
         Return value semantics changed from the previous version: this
         returns the size of the upserted batch (insert OR update), not
@@ -495,7 +566,7 @@ class OSINTPipeline:
         if not validated_indicators:
             return 0
 
-        written_at = datetime.utcnow()
+        written_at = datetime.now(timezone.utc)
 
         # Defensive re-dedup by id, keeping the last occurrence -- see
         # docstring precondition above.
