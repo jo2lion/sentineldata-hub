@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from app.models.threat import ThreatIndicator
 # --- PHASE 5: DATABASE IMPORTS ---
 from sqlalchemy.orm import Session
+from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from app.database.connection import SessionLocal
 from app.database.models import ThreatIndicatorModel
 
@@ -195,47 +196,115 @@ class OSINTPipeline:
 
     def _persist_indicators(self, validated_indicators: List[ThreatIndicator]) -> int:
         """
-        Synchronous SQLAlchemy ORM write path. Deliberately NOT async -- this
-        runs on a worker thread via asyncio.to_thread (see run()), never
-        directly on the event loop. Calling this inline from async code
-        (as it previously was) blocks every other concurrent request on the
-        process for the duration of every DB round-trip in the loop below.
+        Batch upsert write path. Deliberately NOT async -- runs on a worker
+        thread via asyncio.to_thread (see run()), never directly on the
+        event loop, same reasoning as before.
 
-        Known follow-up, not fixed here: this is one SELECT per candidate
-        indicator (N+1). For a genuinely high-throughput pipeline this should
-        become a single batched existence check (SELECT id WHERE id IN (...))
-        or an INSERT ... ON CONFLICT DO NOTHING upsert. Left as-is because
-        that's a real design decision (batch size, conflict semantics), not
-        a one-line fix -- flagging rather than silently changing behavior.
+        Replaces the previous one-SELECT-plus-one-INSERT-per-indicator loop
+        (a real N+1 pattern -- a 200-indicator cycle was up to 400 round
+        trips to SQLite) with a single INSERT ... ON CONFLICT(id) DO UPDATE
+        statement covering the whole batch in one atomic transaction.
+        sqlalchemy.dialects.sqlite.insert() is required here, not the
+        generic sqlalchemy.insert() -- only the dialect-specific construct
+        exposes on_conflict_do_update(). This pipeline is SQLite-only today
+        (see database/connection.py), so that's not a new portability
+        constraint, just one worth stating rather than leaving implicit --
+        this will need a different upsert construct if the DB is ever
+        swapped.
+
+        Conflict target is `id`, the table's primary key -- the same
+        deterministic UUIDv5 computed from title+source_url in
+        _process_batch. On conflict, title/link/summary/published_date/
+        risk_score/ingested_at are all overwritten from the incoming row.
+        title/link normally won't change (they're literally the hash
+        input), but summary/published_date/risk_score legitimately can if
+        an upstream feed edits an entry's description or bumps its
+        <updated> timestamp between polling cycles -- silently keeping the
+        old values on conflict would mean a since-escalated "now critical"
+        indicator never actually updates in the database. ingested_at is
+        explicitly bumped to `written_at` on conflict too, not left at its
+        original insert-time value: that keeps GET /api/v1/metrics'
+        MAX(ingested_at) truthful about when this pipeline last actually
+        wrote a row, insert or update -- leaving it stale on updates would
+        make the dashboard's "Last DB write" lag behind real activity.
+
+        written_at uses naive UTC (datetime.utcnow(), not
+        datetime.now(timezone.utc)) to match the column's own
+        default=datetime.utcnow convention and the naive-datetime
+        assumption GET /api/v1/metrics already makes when re-localizing
+        MAX(ingested_at). Mixing naive and aware values in the same SQLite
+        DATETIME column would compound the naive-column issue already
+        flagged elsewhere, not fix it.
+
+        Return value semantics changed from the previous version: this
+        returns the size of the upserted batch (insert OR update), not
+        "newly inserted rows only" -- SQLite's ON CONFLICT DO UPDATE
+        doesn't cheaply distinguish the two outcomes per row within one
+        statement, and fabricating that distinction would be worse than
+        not reporting it.
+
+        Precondition this method depends on and enforces itself, not just
+        trusts: no two rows in the same INSERT ... ON CONFLICT statement
+        may target the same conflicting key -- SQLite raises "ON CONFLICT
+        DO UPDATE command cannot affect row a second time" if they do.
+        _process_batch's drop_duplicates(subset=["indicator_id"]) already
+        guarantees this upstream, but this method re-deduplicates by id
+        anyway (keeping the last occurrence) rather than silently trusting
+        an invariant it doesn't itself control.
         """
-        stored_count = 0
+        if not validated_indicators:
+            return 0
+
+        written_at = datetime.utcnow()
+
+        # Defensive re-dedup by id, keeping the last occurrence -- see
+        # docstring precondition above.
+        deduped_by_id: Dict[str, ThreatIndicator] = {
+            indicator.id: indicator for indicator in validated_indicators
+        }
+
+        values = [
+            {
+                "id": indicator.id,
+                "title": indicator.title,
+                "link": indicator.source_url,
+                "summary": indicator.description,
+                "published_date": indicator.observed_at,
+                "risk_score": indicator.risk_score,
+                "ingested_at": written_at,
+            }
+            for indicator in deduped_by_id.values()
+        ]
+
         db: Session = SessionLocal()
         try:
-            for indicator in validated_indicators:
-                exists = db.query(ThreatIndicatorModel).filter(ThreatIndicatorModel.id == indicator.id).first()
-                if not exists:
-                    db_record = ThreatIndicatorModel(
-                        id=indicator.id,
-                        title=indicator.title,
-                        link=indicator.source_url,
-                        summary=indicator.description,
-                        published_date=indicator.observed_at,
-                        risk_score=indicator.risk_score
-                    )
-                    db.add(db_record)
-                    stored_count += 1
-
-            if stored_count > 0:
-                db.commit()
-                logger.info(f"Database sync complete. Saved {stored_count} new indicators to SQLite.")
+            upsert_stmt = sqlite_upsert(ThreatIndicatorModel).values(values)
+            upsert_stmt = upsert_stmt.on_conflict_do_update(
+                index_elements=[ThreatIndicatorModel.id],
+                set_={
+                    "title": upsert_stmt.excluded.title,
+                    "link": upsert_stmt.excluded.link,
+                    "summary": upsert_stmt.excluded.summary,
+                    "published_date": upsert_stmt.excluded.published_date,
+                    "risk_score": upsert_stmt.excluded.risk_score,
+                    "ingested_at": upsert_stmt.excluded.ingested_at,
+                },
+            )
+            db.execute(upsert_stmt)
+            db.commit()
+            logger.info(
+                "ingestion.persistence_batch_upsert_complete",
+                extra={"batch_size": len(values)},
+            )
         except Exception:
             db.rollback()
             logger.error("Database persistence sub-cycle failed.", exc_info=True)
             # Fail-open: don't crash the network request if storage hits a localized snag
+            return 0
         finally:
             db.close()
 
-        return stored_count
+        return len(values)
 
     async def run(self) -> List[ThreatIndicator]:
         """
