@@ -18,3 +18,24 @@ export interface ThreatIndicator {
   /** ISO 8601 datetime string. Backend now enforces tz-aware UTC at validation time. */
   observed_at: string;
 }
+
+/**
+ * Mirrors backend/app/models/metrics.py::DashboardMetrics exactly.
+ *
+ * NOTE on nullability -- this deliberately deviates from a literal
+ * "latest_ingestion_time: string" spec. The backend computes this field via
+ * SQL MAX(ingested_at) over the stored indicator table. On an empty table
+ * (fresh deploy, or a wholesale outage before the first successful cycle)
+ * that MAX is SQL NULL, which FastAPI/Pydantic serializes as JSON `null` --
+ * not an absent key, not an empty string. Typing this as a bare `string`
+ * would compile cleanly and then lie at runtime the first time someone
+ * calls `.toLocaleString()` (or similar) on a `null` typed as `string`.
+ * `string | null` is what the backend actually sends; the frontend must
+ * handle both.
+ */
+export interface DashboardMetrics {
+  total_indicators: number;
+  critical_count: number;
+  high_count: number;
+  latest_ingestion_time: string | null;
+}

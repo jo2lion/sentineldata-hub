@@ -67,13 +67,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import ValidationError
+from sqlalchemy import case, func
+from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.data.pipeline import OSINTPipeline
+from app.models.metrics import DashboardMetrics
 from app.models.threat import ThreatIndicator
 
 # --- PHASE 5: DATABASE SCHEMATIC INTERFACES ---
-from app.database.connection import Base, engine
+from app.database.connection import Base, engine, get_db
 from app.database.models import ThreatIndicatorModel  # Pre-loads and registers table metadata with the Base object
 
 # --------------------------------------------------------------------------- #
@@ -199,7 +202,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
         start = time.monotonic()
-        
+
         # Initialize our pipeline instance cleanly
         pipeline = OSINTPipeline(target_feeds=feed_targets)
 
@@ -315,7 +318,7 @@ async def get_threats(request: Request) -> list[ThreatIndicator]:
     cycle_start = time.monotonic()
     try:
         indicators = await asyncio.wait_for(
-            pipeline.run(), 
+            pipeline.run(),
             timeout=timeout_seconds
         )
     except TimeoutError as exc:
@@ -349,8 +352,67 @@ async def get_threats(request: Request) -> list[ThreatIndicator]:
             "ingestion.cycle_complete",
             extra={"indicator_count": len(indicators), "elapsed_ms": elapsed_ms},
         )
-        
+
     return indicators
+
+
+@app.get(
+    "/api/v1/metrics",
+    response_model=DashboardMetrics,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_api_key)],
+    summary="Return server-computed KPI aggregates over the stored threat indicator set.",
+)
+def get_metrics(db: Session = Depends(get_db)) -> DashboardMetrics:
+    """Aggregate telemetry over the SQLite-held indicator store.
+
+    Deliberately a plain `def`, not `async def`. FastAPI dispatches sync
+    route functions -- and sync dependencies, which get_db is: a plain
+    generator, not an async generator -- to its worker threadpool
+    automatically, off the event loop. That is the same non-blocking
+    guarantee _persist_indicators needed an explicit asyncio.to_thread for
+    in pipeline.py, obtained here for free because there is no async code
+    path in this function to accidentally share the event loop with.
+
+    All three counts and the freshness timestamp are computed in ONE query
+    via SQL aggregates (COUNT / SUM(CASE...) / MAX), so this scales with an
+    index scan against threat_indicators, not with a full-table pull into
+    Python that would otherwise be the obvious -- and wrong, at scale --
+    first draft.
+    """
+    row = db.query(
+        func.count(ThreatIndicatorModel.id).label("total_indicators"),
+        func.sum(
+            case((ThreatIndicatorModel.risk_score >= 5.0, 1), else_=0)
+        ).label("critical_count"),
+        func.sum(
+            case(
+                (
+                    (ThreatIndicatorModel.risk_score >= 4.0)
+                    & (ThreatIndicatorModel.risk_score < 5.0),
+                    1,
+                ),
+                else_=0,
+            )
+        ).label("high_count"),
+        func.max(ThreatIndicatorModel.ingested_at).label("latest_ingestion_time"),
+    ).one()
+
+    latest_ingestion_time = row.latest_ingestion_time
+    if latest_ingestion_time is not None and latest_ingestion_time.tzinfo is None:
+        # SQLite has no true timezone-aware column type -- every datetime
+        # written here (see database/models.py: ingested_at default is
+        # datetime.utcnow) round-trips through the driver as naive. We know
+        # by construction it was always written as UTC, so re-localizing on
+        # read is a correct reconstruction, not a guess.
+        latest_ingestion_time = latest_ingestion_time.replace(tzinfo=timezone.utc)
+
+    return DashboardMetrics(
+        total_indicators=row.total_indicators or 0,
+        critical_count=row.critical_count or 0,
+        high_count=row.high_count or 0,
+        latest_ingestion_time=latest_ingestion_time,
+    )
 
 
 @app.get("/healthz", include_in_schema=False, status_code=status.HTTP_200_OK)
