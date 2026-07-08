@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 import uuid
 from typing import List, Dict, Any, Optional
@@ -121,6 +121,17 @@ class OSINTPipeline:
     High-throughput asynchronous data pipeline for ingesting, processing,
     and validating unstructured OSINT and CVE threat streams.
     """
+
+    # Circuit-breaker tuning -- ticket-specified exact values, not derived
+    # from any measured SLO. 5 consecutive failed fetches for a given feed
+    # URL (see _record_fetch_outcome) trips that URL's breaker; a tripped
+    # URL is bypassed entirely -- no network call attempted at all, see
+    # run()'s CIRCUIT BREAKER section -- for 10 minutes, then given one
+    # unbiased trial fetch on the next cycle that starts after the cooldown
+    # expires.
+    _CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = 5
+    _CIRCUIT_BREAKER_COOLDOWN: timedelta = timedelta(minutes=10)
+
     def __init__(self, target_feeds: List[str]):
         self.target_feeds = target_feeds
         # Implement lazy-loading properties protected by an atomic lock boundary
@@ -134,6 +145,23 @@ class OSINTPipeline:
         # task removes itself via add_done_callback once it completes (see
         # run()), so this set only ever holds genuinely in-flight tasks.
         self._background_tasks: set = set()
+        # Circuit-breaker state, keyed by feed URL string -- see
+        # _circuit_is_open / _record_fetch_outcome and run()'s CIRCUIT
+        # BREAKER section for the full state machine. Both dicts are
+        # mutated ONLY from plain synchronous methods (no `await` anywhere
+        # in their bodies) called from run() -- under asyncio's cooperative
+        # scheduling, a synchronous method body can never be interleaved by
+        # another task, so no asyncio.Lock is needed here the way one is
+        # for _http_client's lazy-init double-check above. This does NOT
+        # prevent two concurrent run() invocations (e.g. two overlapping
+        # /api/v1/threats requests sharing the one app.state.pipeline
+        # instance -- see main.py) from each independently deciding to
+        # fetch the same not-yet-tripped feed in the same window; that
+        # duplicate-concurrent-ingestion-cycle behavior predates this
+        # change and is not solved by it -- flagged, not fixed, out of this
+        # ticket's scope.
+        self._consecutive_failures: Dict[str, int] = {}
+        self._circuit_open_until: Dict[str, datetime] = {}
 
     @property
     async def http_client(self) -> httpx.AsyncClient:
@@ -680,6 +708,77 @@ class OSINTPipeline:
 
         return len(values)
 
+    def _circuit_is_open(self, url: str) -> bool:
+        """
+        True if `url` is currently inside its circuit-breaker cooldown
+        window and must be bypassed entirely this cycle -- see run()'s
+        CIRCUIT BREAKER section for where this gates the fetch list.
+
+        A URL with no entry in _circuit_open_until has never tripped (or
+        tripped once and has since been cleared by a successful trial
+        fetch in _record_fetch_outcome) and is always open-for-business
+        here -- that's why this reads via .get(url) (defaulting a missing
+        entry to "not open") rather than assuming every feed URL has an
+        existing entry.
+        """
+        cooldown_until = self._circuit_open_until.get(url)
+        return cooldown_until is not None and datetime.now(timezone.utc) < cooldown_until
+
+    def _record_fetch_outcome(self, url: str, succeeded: bool) -> None:
+        """
+        Updates `url`'s consecutive-failure counter and trips its circuit
+        if the threshold is reached. Called exactly once per feed URL that
+        was actually attempted this cycle -- run() never calls this for a
+        bypassed/cooldown URL, since there is no outcome to record for a
+        fetch that never ran.
+
+        `succeeded` means "fetch_feed_data returned a non-None string",
+        which is deliberately broader than this ticket's literal "HTTP/
+        network exceptions or timeouts" wording: fetch_feed_data also
+        returns None when it rejects a same-origin-abusing redirect (see
+        that method's own docstring -- the SSRF boundary). Treating a
+        persistently-redirecting feed the same as a persistently-timing-out
+        one is a deliberate choice, not an oversight: operationally, both
+        mean "this URL has given us zero usable bytes for N cycles in a
+        row," and continuing to spend a request on it every cycle serves no
+        purpose in either case. This does NOT weaken the SSRF defense --
+        every attempted fetch still evaluates and rejects the redirect
+        exactly as before (see fetch_feed_data); circuit-breaking only
+        reduces how often we bother making the attempt at all.
+
+        A True result resets the counter to 0 outright on ANY call -- even
+        one immediately after a long failure streak -- not to
+        (threshold - 1) or some partial credit: one clean fetch is treated
+        as full recovery, matching the ticket's "resetting the counter on
+        the next successful ... cycle" wording exactly.
+        """
+        if succeeded:
+            self._consecutive_failures[url] = 0
+            self._circuit_open_until.pop(url, None)
+            return
+
+        failures = self._consecutive_failures.get(url, 0) + 1
+        self._consecutive_failures[url] = failures
+
+        if failures >= self._CIRCUIT_BREAKER_FAILURE_THRESHOLD:
+            # Deliberately NOT reset to 0 here -- only a success resets it
+            # (see above). That means a single renewed failure on the very
+            # next post-cooldown trial fetch keeps the counter at/above
+            # threshold and re-trips immediately with a fresh cooldown,
+            # rather than requiring 5 MORE consecutive failures to notice a
+            # feed that never actually recovered. A feed that trips, then
+            # succeeds even once, still gets the full reset above.
+            cooldown_until = datetime.now(timezone.utc) + self._CIRCUIT_BREAKER_COOLDOWN
+            self._circuit_open_until[url] = cooldown_until
+            logger.error(
+                "ingestion.circuit_breaker.tripped_for_feed",
+                extra={
+                    "feed_url": url,
+                    "consecutive_failures": failures,
+                    "cooldown_until": cooldown_until.isoformat(),
+                },
+            )
+
     async def run(self) -> List[ThreatIndicator]:
         """
         Pipeline entry point. Executes async network gathering, hands off payload
@@ -725,28 +824,76 @@ class OSINTPipeline:
         which already safely skips any falsy/None entry (see its own
         `if not raw_payload: continue`) -- so an exception surviving this
         far costs that one feed's data for this cycle, nothing more.
+
+        CIRCUIT BREAKER (added this pass): each feed URL carries its own
+        consecutive-failure counter and cooldown timestamp (see
+        _circuit_is_open / _record_fetch_outcome). A URL that fails 5
+        times in a row is bypassed entirely -- no coroutine created, no
+        network call attempted -- for the next 10 minutes, then given one
+        unbiased trial fetch on whichever cycle next runs after that
+        window closes. This interacts with one pre-existing piece of
+        infrastructure worth naming: main.py wraps this whole method in
+        asyncio.wait_for(..., timeout=SENTINEL_INGESTION_TIMEOUT_SECONDS).
+        If THAT timeout fires mid-gather, this method is cancelled before
+        reaching the outcome-recording loop below at all -- meaning a
+        cycle that times out contributes zero circuit-breaker signal for
+        any feed that cycle, even ones that individually would have
+        resolved fast. That is an existing interaction, not a new gap this
+        pass introduces, and is not addressed here.
         """
         logger.info(f"Starting ingestion cycle across {len(self.target_feeds)} targets.")
 
-        fetch_tasks = [self.fetch_feed_data(url) for url in self.target_feeds]
+        # --- CIRCUIT BREAKER: pre-fetch gate ---
+        # Any feed URL currently inside its cooldown window (see
+        # _circuit_is_open) is bypassed entirely: no coroutine is created
+        # for it at all, and it contributes None at its original index in
+        # raw_payloads -- indistinguishable downstream from any other
+        # failed fetch, since _parse_and_vectorize already treats any
+        # falsy entry as "nothing from this feed this cycle." Indexed, not
+        # dict-keyed, deliberately: self.target_feeds could in principle
+        # contain the same URL string twice (a misconfigured
+        # SENTINEL_FEED_URLS with a duplicate), and each occurrence must
+        # still get its own independent fetch attempt and its own slot in
+        # raw_payloads when not bypassed, exactly as it did before this
+        # pass -- collapsing by URL string into a dict would silently
+        # merge those into one shared fetch/result and change that
+        # behavior.
+        fetch_indices: List[int] = []
+        fetch_tasks = []
+        bypassed_urls: List[str] = []
+        raw_payloads: List[Optional[str]] = [None] * len(self.target_feeds)
+
+        for index, url in enumerate(self.target_feeds):
+            if self._circuit_is_open(url):
+                bypassed_urls.append(url)
+                continue
+            fetch_indices.append(index)
+            fetch_tasks.append(self.fetch_feed_data(url))
+
+        if bypassed_urls:
+            logger.warning(
+                "ingestion.circuit_breaker.bypassed_fetch",
+                extra={"feed_urls": bypassed_urls, "bypassed_count": len(bypassed_urls)},
+            )
+
         raw_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-        raw_payloads: List[Optional[str]] = []
-        for url, result in zip(self.target_feeds, raw_results):
+        # --- CIRCUIT BREAKER: post-fetch outcome recording ---
+        # Only feeds actually attempted this cycle (fetch_indices) get an
+        # outcome recorded here -- see _record_fetch_outcome's own
+        # docstring for why a bypassed feed must never reach that call.
+        for index, result in zip(fetch_indices, raw_results):
+            url = self.target_feeds[index]
             if isinstance(result, BaseException):
-                # Anything landing here escaped fetch_feed_data's own
-                # httpx-specific handling -- logged with the feed URL
-                # attached, same discipline fetch_feed_data's own log lines
-                # already apply to the failure classes it catches itself,
-                # then normalized to None to match fetch_feed_data's
-                # existing None-on-failure contract exactly.
                 logger.error(
                     "ingestion.feed_fetch_task_raised_unexpectedly",
                     extra={"feed_url": url, "reason": str(result)},
                 )
-                raw_payloads.append(None)
+                raw_payloads[index] = None
+                self._record_fetch_outcome(url, succeeded=False)
             else:
-                raw_payloads.append(result)
+                raw_payloads[index] = result
+                self._record_fetch_outcome(url, succeeded=result is not None)
 
         # Offload heavy Pandas parsing and array manipulation to a background worker thread
         processed_df = await asyncio.to_thread(self._parse_and_vectorize, raw_payloads)

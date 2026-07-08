@@ -349,6 +349,163 @@ function MetricsPanel() {
   );
 }
 
+// --------------------------------------------------------------------------- #
+// CVE Year x Severity cross-tabulation grid
+//
+// Purely a client-side derived view over useThreats()'s existing `data`
+// array -- no new network request, no new query key. Aggregation is
+// memoized inside this component (not lifted into App()'s own useMemo)
+// since it depends only on the `indicators` prop, keeping the memoization
+// colocated with the data it derives from.
+//
+// Severity tiers mirror riskTone()'s exact thresholds above (5.0 / 4.0 /
+// 3.0) -- duplicated here, not shared, because riskTone returns a Tailwind
+// class string for a single row's text color, while this needs a bucket
+// LABEL to cross-tabulate an entire array; forcing one to call the other
+// would mean either parsing a class string back into a tier name (fragile)
+// or making riskTone depend on a tier enum it has no other reason to know
+// about. This is now the THIRD call site sharing these exact three cutoffs
+// (riskTone, matchesRiskFilter's 3-bucket variant, and this one) -- a real,
+// flagged duplication risk: if backend/app/data/pipeline.py's
+// _process_batch risk tiers ever change, all three need to change together,
+// and nothing enforces that today. Not unified into one shared source of
+// truth in this pass -- out of this ticket's scope, and touching
+// riskTone/matchesRiskFilter risks regressing two already-working,
+// differently-shaped call sites for a ticket that didn't ask for that.
+//
+// Year is read from `observed_at` (ISO 8601 UTC string per
+// pipeline.py's UTCDateTime + ThreatIndicator's own aware-only validator)
+// via `new Date(...).getFullYear()` -- browser-LOCAL year, not UTC year.
+// This mirrors every other Date rendering already in this file (the
+// table's Observed At column and MetricsPanel's "Last DB write" line both
+// already call .toLocaleString() on a `new Date(...)`, i.e. already
+// browser-local), so this grid stays consistent with what the rest of the
+// page already shows the viewer -- at the cost of the well-known caveat
+// that a threat observed at 2025-12-31T23:30:00Z would bucket under 2026
+// for a viewer in a positive UTC offset. Flagged, not solved: fixing it
+// means deciding whether the WHOLE page should switch to UTC-year display,
+// not just this grid, which is out of this ticket's scope.
+//
+// Malformed/unparseable observed_at values (`new Date(...)` producing an
+// Invalid Date, whose .getFullYear() is NaN) are excluded from the tally
+// entirely rather than surfacing as a "NaN" row or silently miscounted
+// under year 0 -- ThreatIndicator.observed_at is a required, validated
+// field server-side, so this should not happen in practice, but the grid
+// must not crash or render garbage if a future write path ever bypasses
+// that validation.
+// --------------------------------------------------------------------------- #
+
+type SeverityTier = "Critical" | "High" | "Medium" | "Low";
+
+const SEVERITY_TIERS: readonly SeverityTier[] = ["Critical", "High", "Medium", "Low"];
+
+function classifySeverityTier(riskScore: number): SeverityTier {
+  if (riskScore >= 5.0) return "Critical";
+  if (riskScore >= 4.0) return "High";
+  if (riskScore >= 3.0) return "Medium";
+  return "Low";
+}
+
+const SEVERITY_TIER_TEXT_CLASS: Record<SeverityTier, string> = {
+  Critical: "text-signal-critical",
+  High: "text-signal-warning",
+  Medium: "text-signal-warning/70",
+  Low: "text-signal-ok",
+};
+
+type YearSeverityRow = {
+  year: number;
+  counts: Record<SeverityTier, number>;
+  total: number;
+};
+
+function aggregateByYearAndSeverity(indicators: ThreatIndicator[]): YearSeverityRow[] {
+  const rowsByYear = new Map<number, Record<SeverityTier, number>>();
+
+  for (const indicator of indicators) {
+    const year = new Date(indicator.observed_at).getFullYear();
+    if (Number.isNaN(year)) continue; // see module comment above
+
+    let counts = rowsByYear.get(year);
+    if (!counts) {
+      counts = { Critical: 0, High: 0, Medium: 0, Low: 0 };
+      rowsByYear.set(year, counts);
+    }
+    counts[classifySeverityTier(indicator.risk_score)] += 1;
+  }
+
+  return Array.from(rowsByYear.entries())
+    .map(([year, counts]) => ({
+      year,
+      counts,
+      total: counts.Critical + counts.High + counts.Medium + counts.Low,
+    }))
+    .sort((a, b) => b.year - a.year); // most recent year first
+}
+
+function CveMetricsGrid({ indicators }: { indicators: ThreatIndicator[] | undefined }) {
+  // Null-safe by construction: `indicators` is undefined during the
+  // pre-first-response window (React Query has no cached data yet) and
+  // during the isError path -- aggregateByYearAndSeverity always receives
+  // a real array (falling back to []) so it never has to null-check
+  // internally, and the zero-row branch below covers both "no data yet"
+  // and "data loaded but genuinely empty" with the same message, since
+  // from this component's perspective they are the same "nothing to
+  // cross-tabulate yet" state.
+  const rows = useMemo(() => aggregateByYearAndSeverity(indicators ?? []), [indicators]);
+
+  return (
+    <div className="mb-6 overflow-hidden rounded-lg border border-grid-800 bg-grid-900">
+      <div className="border-b border-grid-800 px-4 py-3">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-grid-300">
+          CVE Volume by Year &amp; Severity
+        </h2>
+      </div>
+
+      {rows.length === 0 ? (
+        <p className="px-4 py-6 text-center text-sm text-grid-400">
+          No dated indicators to aggregate yet.
+        </p>
+      ) : (
+        <table className="w-full text-left text-sm">
+          <thead className="bg-grid-900 text-grid-300">
+            <tr>
+              <th className="px-4 py-2 font-medium">Year</th>
+              {SEVERITY_TIERS.map((tier) => (
+                <th
+                  key={tier}
+                  className={`px-4 py-2 text-right font-medium ${SEVERITY_TIER_TEXT_CLASS[tier]}`}
+                >
+                  {tier}
+                </th>
+              ))}
+              <th className="px-4 py-2 text-right font-medium text-grid-100">Total</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-grid-800">
+            {rows.map((row) => (
+              <tr key={row.year}>
+                <td className="px-4 py-2 font-mono text-grid-100">{row.year}</td>
+                {SEVERITY_TIERS.map((tier) => (
+                  <td
+                    key={tier}
+                    className={`px-4 py-2 text-right font-mono ${SEVERITY_TIER_TEXT_CLASS[tier]}`}
+                  >
+                    {row.counts[tier]}
+                  </td>
+                ))}
+                <td className="px-4 py-2 text-right font-mono font-semibold text-grid-100">
+                  {row.total}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const { data, isLoading, isFetching, isError, error, dataUpdatedAt } = useThreats();
 
@@ -394,6 +551,8 @@ export default function App() {
 
       <main className="mx-auto max-w-6xl px-6 py-8">
         <MetricsPanel />
+
+        <CveMetricsGrid indicators={data} />
 
         {isLoading && <p className="text-sm text-grid-300">Running ingestion cycle…</p>}
 
